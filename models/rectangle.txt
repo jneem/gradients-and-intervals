@@ -1,0 +1,12 @@
+x var-x
+nx neg x
+y var-y
+ny neg y
+r const 0.5
+x0 sub x r
+x1 sub nx r
+y0 sub y r
+y1 sub ny r
+xs max x0 x1
+ys max y0 y1
+out max xs ys

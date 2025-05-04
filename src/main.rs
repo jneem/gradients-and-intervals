@@ -1,12 +1,16 @@
 use clap::Parser;
-use fidget::eval::MathFunction;
-use fidget::types::{Grad, Interval};
+use fidget::{
+    types::{Grad, Interval},
+    vm::Choice,
+};
 use image::{ImageBuffer, Rgba};
 use std::{collections::HashMap, path::PathBuf};
 
+#[derive(Copy, Clone, Debug)]
 enum Op {
     VarX,
     VarY,
+    Copy(u32),
     Const(f32),
     Square(u32),
     Neg(u32),
@@ -84,28 +88,94 @@ struct Args {
 
     #[clap(long)]
     normalize: bool,
+
+    #[clap(long)]
+    fancy: bool,
+
+    #[clap(short = 'N', default_value_t = 1)]
+    count: u32,
 }
 
-fn pixel_f(ops: &[(u32, Op)], scratch: &mut Vec<f32>, x: f32, y: f32) -> f32 {
-    scratch.resize(ops.len(), 0.0);
+fn pixel_f<const N: usize>(
+    ops: &[(u32, Op)],
+    scratch: &mut Vec<[f32; N]>,
+    x: [f32; N],
+    y: [f32; N],
+) -> [f32; N] {
+    scratch.resize(
+        ops.last().map(|(i, _)| *i as usize).unwrap_or(0) + 1,
+        [f32::NAN; N],
+    );
     for (i, op) in ops {
-        let v = match op {
-            Op::VarX => x,
-            Op::VarY => y,
-            Op::Add(a, b) => scratch[*a as usize] + scratch[*b as usize],
-            Op::Sub(a, b) => scratch[*a as usize] - scratch[*b as usize],
-            Op::Mul(a, b) => scratch[*a as usize] * scratch[*b as usize],
-            Op::Div(a, b) => scratch[*a as usize] / scratch[*b as usize],
-            Op::Max(a, b) => scratch[*a as usize].max(scratch[*b as usize]),
-            Op::Min(a, b) => scratch[*a as usize].min(scratch[*b as usize]),
-            Op::Const(f) => *f,
-            Op::Square(a) => scratch[*a as usize].powi(2),
-            Op::Neg(a) => -scratch[*a as usize],
-            Op::Sqrt(a) => scratch[*a as usize].sqrt(),
+        let i = *i as usize;
+        match op {
+            Op::VarX => scratch[i] = x,
+            Op::VarY => scratch[i] = y,
+            Op::Copy(a) => scratch[i] = scratch[*a as usize],
+            Op::Add(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] + scratch[*b as usize][j]
+                }
+            }
+            Op::Sub(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] - scratch[*b as usize][j]
+                }
+            }
+            Op::Mul(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] * scratch[*b as usize][j]
+                }
+            }
+            Op::Div(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] / scratch[*b as usize][j]
+                }
+            }
+            Op::Max(a, b) => {
+                for j in 0..N {
+                    assert!(!scratch[*a as usize][j].is_nan());
+                    assert!(!scratch[*b as usize][j].is_nan());
+                    scratch[i][j] =
+                        scratch[*a as usize][j].max(scratch[*b as usize][j])
+                }
+            }
+            Op::Min(a, b) => {
+                for j in 0..N {
+                    assert!(!scratch[*a as usize][j].is_nan());
+                    assert!(!scratch[*b as usize][j].is_nan());
+                    scratch[i][j] =
+                        scratch[*a as usize][j].min(scratch[*b as usize][j])
+                }
+            }
+            Op::Const(f) => {
+                for j in 0..N {
+                    scratch[i][j] = *f;
+                }
+            }
+            Op::Square(a) => {
+                for j in 0..N {
+                    let v = scratch[*a as usize][j];
+                    scratch[i][j] = v * v;
+                }
+            }
+            Op::Neg(a) => {
+                for j in 0..N {
+                    scratch[i][j] = -scratch[*a as usize][j];
+                }
+            }
+            Op::Sqrt(a) => {
+                for j in 0..N {
+                    scratch[i][j] = scratch[*a as usize][j].sqrt();
+                }
+            }
         };
-        scratch[*i as usize] = v;
     }
-    scratch.last().cloned().unwrap_or(0.0)
+    scratch.last().cloned().unwrap_or([0.0; N])
 }
 
 /// Normalizes to a gradient of 1
@@ -119,71 +189,379 @@ pub fn normalize(g: Grad) -> Grad {
     Grad::new(g.v / norm, g.dx / norm, g.dy / norm, g.dz / norm)
 }
 
-fn pixel_g(ops: &[(u32, Op)], scratch: &mut Vec<Grad>, x: f32, y: f32) -> Grad {
-    scratch.resize(ops.len(), Grad::from(0.0));
-    for (i, op) in ops {
-        let v = match op {
-            Op::VarX => Grad::new(x, 1.0, 0.0, 0.0),
-            Op::VarY => Grad::new(y, 0.0, 1.0, 0.0),
-            Op::Add(a, b) => scratch[*a as usize] + scratch[*b as usize],
-            Op::Sub(a, b) => scratch[*a as usize] - scratch[*b as usize],
-            Op::Mul(a, b) => scratch[*a as usize] * scratch[*b as usize],
-            Op::Div(a, b) => scratch[*a as usize] / scratch[*b as usize],
-            Op::Max(a, b) => normalize(scratch[*a as usize])
-                .max(normalize(scratch[*b as usize])),
-            Op::Min(a, b) => normalize(scratch[*a as usize])
-                .min(normalize(scratch[*b as usize])),
-            Op::Const(f) => Grad::from(*f),
-            Op::Square(a) => {
-                let v = scratch[*a as usize];
-                v * v
-            }
-            Op::Neg(a) => -scratch[*a as usize],
-            Op::Sqrt(a) => scratch[*a as usize].sqrt(),
-        };
-        scratch[*i as usize] = v;
-    }
-    scratch.last().cloned().unwrap_or(Grad::from(0.0))
-}
-
-fn interval_i(
+fn pixel_g<const N: usize>(
     ops: &[(u32, Op)],
-    scratch: &mut Vec<Interval>,
-    x: Interval,
-    y: Interval,
-) -> Interval {
-    scratch.resize(ops.len(), Interval::from(0.0));
+    scratch: &mut Vec<[Grad; N]>,
+    x: [f32; N],
+    y: [f32; N],
+) -> [Grad; N] {
+    scratch.resize(ops.len(), [Grad::from(0.0); N]);
     for (i, op) in ops {
-        let v = match op {
-            Op::VarX => x,
-            Op::VarY => y,
-            Op::Add(a, b) => scratch[*a as usize] + scratch[*b as usize],
-            Op::Sub(a, b) => scratch[*a as usize] - scratch[*b as usize],
-            Op::Mul(a, b) => scratch[*a as usize] * scratch[*b as usize],
-            Op::Div(a, b) => scratch[*a as usize] / scratch[*b as usize],
+        let i = *i as usize;
+        match op {
+            Op::VarX => {
+                for (j, x) in x.iter().enumerate() {
+                    scratch[i][j] = Grad::new(*x, 1.0, 0.0, 0.0)
+                }
+            }
+            Op::VarY => {
+                for (j, y) in y.iter().enumerate() {
+                    scratch[i][j] = Grad::new(*y, 0.0, 1.0, 0.0)
+                }
+            }
+            Op::Copy(a) => scratch[i] = scratch[*a as usize],
+            Op::Add(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] + scratch[*b as usize][j]
+                }
+            }
+            Op::Sub(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] - scratch[*b as usize][j]
+                }
+            }
+            Op::Mul(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] * scratch[*b as usize][j]
+                }
+            }
+            Op::Div(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] / scratch[*b as usize][j]
+                }
+            }
             Op::Max(a, b) => {
-                scratch[*a as usize].max_choice(scratch[*b as usize]).0
+                for j in 0..N {
+                    scratch[i][j] = normalize(scratch[*a as usize][j])
+                        .max(normalize(scratch[*b as usize][j]))
+                }
             }
             Op::Min(a, b) => {
-                scratch[*a as usize].min_choice(scratch[*b as usize]).0
+                for j in 0..N {
+                    scratch[i][j] = normalize(scratch[*a as usize][j])
+                        .min(normalize(scratch[*b as usize][j]))
+                }
             }
-            Op::Const(f) => Interval::from(*f),
+            Op::Const(f) => {
+                for j in 0..N {
+                    scratch[i][j] = Grad::from(*f)
+                }
+            }
             Op::Square(a) => {
-                let v = scratch[*a as usize];
-                v * v
+                for j in 0..N {
+                    let v = scratch[*a as usize][j];
+                    scratch[i][j] = v * v;
+                }
             }
-            Op::Neg(a) => -scratch[*a as usize],
-            Op::Sqrt(a) => scratch[*a as usize].sqrt(),
+            Op::Neg(a) => {
+                for j in 0..N {
+                    scratch[i][j] = -scratch[*a as usize][j];
+                }
+            }
+            Op::Sqrt(a) => {
+                for j in 0..N {
+                    scratch[i][j] = scratch[*a as usize][j].sqrt();
+                }
+            }
         };
-        scratch[*i as usize] = v;
     }
-    scratch.last().cloned().unwrap_or(Interval::from(0.0))
+    scratch.last().cloned().unwrap_or([Grad::from(0.0); N])
+}
+
+fn interval_i<const N: usize>(
+    ops: &[(u32, Op)],
+    scratch: &mut Vec<[Interval; N]>,
+    x: [Interval; N],
+    y: [Interval; N],
+) -> ([Interval; N], Vec<[Choice; N]>) {
+    scratch.resize(ops.len(), [Interval::from(0.0); N]);
+    let mut choices = vec![];
+    for (i, op) in ops {
+        let i = *i as usize;
+        match op {
+            Op::VarX => {
+                scratch[i] = x;
+            }
+            Op::VarY => {
+                scratch[i] = y;
+            }
+            Op::Copy(a) => scratch[i] = scratch[*a as usize],
+            Op::Add(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] + scratch[*b as usize][j]
+                }
+            }
+            Op::Sub(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] - scratch[*b as usize][j]
+                }
+            }
+            Op::Mul(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] * scratch[*b as usize][j]
+                }
+            }
+            Op::Div(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] / scratch[*b as usize][j]
+                }
+            }
+            Op::Max(a, b) => {
+                let mut cs = [Choice::Both; N];
+                for (j, cs) in cs.iter_mut().enumerate() {
+                    let (v, c) = scratch[*a as usize][j]
+                        .max_choice(scratch[*b as usize][j]);
+                    scratch[i][j] = v;
+                    *cs = c;
+                }
+                choices.push(cs);
+            }
+            Op::Min(a, b) => {
+                let mut cs = [Choice::Both; N];
+                for (j, cs) in cs.iter_mut().enumerate() {
+                    let (v, c) = scratch[*a as usize][j]
+                        .min_choice(scratch[*b as usize][j]);
+                    scratch[i][j] = v;
+                    *cs = c;
+                }
+                choices.push(cs);
+            }
+            Op::Const(f) => {
+                for j in 0..N {
+                    scratch[i][j] = Interval::from(*f)
+                }
+            }
+            Op::Square(a) => {
+                for j in 0..N {
+                    let v = scratch[*a as usize][j];
+                    scratch[i][j] = v * v;
+                }
+            }
+            Op::Neg(a) => {
+                for j in 0..N {
+                    scratch[i][j] = -scratch[*a as usize][j];
+                }
+            }
+            Op::Sqrt(a) => {
+                for j in 0..N {
+                    scratch[i][j] = scratch[*a as usize][j].sqrt();
+                }
+            }
+        };
+    }
+    (
+        scratch.last().cloned().unwrap_or([Interval::from(0.0); N]),
+        choices,
+    )
+}
+
+fn simplify<const N: usize>(
+    ops: &[(u32, Op)],
+    choices: &[[Choice; N]],
+) -> [Vec<(u32, Op)>; N] {
+    let mut out = [(); N].map(|()| vec![]);
+    let mut active = vec![[0; N]; ops.len()];
+    let mut choices = choices.iter().rev();
+    if let Some(a) = active.last_mut() {
+        *a = [1; N];
+    }
+    let push_copy = |v: &mut Vec<(u32, Op)>, allowed: bool, i: u32, a: u32| {
+        if let Some((_i, Op::Copy(prev))) = v.last_mut() {
+            if allowed && *prev == i {
+                *prev = a;
+                return;
+            }
+        }
+        v.push((i, Op::Copy(a)));
+    };
+    for (i, o) in ops.iter().rev() {
+        match o {
+            Op::Const(..) | Op::VarX | Op::VarY => {
+                for (j, v) in out.iter_mut().enumerate() {
+                    if active[*i as usize][j] > 0 {
+                        v.push((*i, *o))
+                    }
+                }
+            }
+            Op::Copy(a) => {
+                for (j, v) in out.iter_mut().enumerate() {
+                    if active[*i as usize][j] > 0 {
+                        push_copy(v, active[*i as usize][j] == 1, *i, *a);
+                    }
+                }
+            }
+            Op::Sqrt(a) | Op::Square(a) | Op::Neg(a) => {
+                for (j, v) in out.iter_mut().enumerate() {
+                    if active[*i as usize][j] > 0 {
+                        active[*a as usize][j] += 1;
+                        v.push((*i, *o));
+                    }
+                }
+            }
+            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) => {
+                for (j, v) in out.iter_mut().enumerate() {
+                    if active[*i as usize][j] > 0 {
+                        active[*a as usize][j] += 1;
+                        active[*b as usize][j] += 1;
+                        v.push((*i, *o));
+                    }
+                }
+            }
+            Op::Min(a, b) | Op::Max(a, b) => {
+                let cs = choices.next().unwrap();
+                for (j, v) in out.iter_mut().enumerate() {
+                    if active[*i as usize][j] > 0 {
+                        match cs[j] {
+                            Choice::Left => {
+                                active[*a as usize][j] += 1;
+                                push_copy(
+                                    v,
+                                    active[*i as usize][j] == 1,
+                                    *i,
+                                    *a,
+                                );
+                            }
+                            Choice::Right => {
+                                active[*b as usize][j] += 1;
+                                push_copy(
+                                    v,
+                                    active[*i as usize][j] == 1,
+                                    *i,
+                                    *b,
+                                );
+                            }
+                            Choice::Both => {
+                                active[*a as usize][j] += 1;
+                                active[*b as usize][j] += 1;
+                                v.push((*i, *o))
+                            }
+                            Choice::Unknown => panic!(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(choices.next().is_none());
+    for a in &mut out {
+        a.reverse()
+    }
+    out
 }
 
 fn shade(f: f32) -> [u8; 4] {
     use fidget::render::RenderMode;
     let [r, g, b] = fidget::render::SdfPixelRenderMode::pixel(f);
     [r, g, b, 255]
+}
+
+fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
+    const TILE_SIZE: u32 = 32;
+    const INTERVAL_SIMD_SIZE: u32 = 16;
+    const FLOAT_SIMD_SIZE: u32 = 16;
+    assert_eq!(
+        TILE_SIZE % FLOAT_SIMD_SIZE,
+        0,
+        "chunk size must be divisible by SIMD size"
+    );
+
+    #[derive(Debug)]
+    struct Tile {
+        x: u32,
+        y: u32,
+    }
+    assert_eq!(
+        size % INTERVAL_SIMD_SIZE,
+        0,
+        "image size must be divisible by {INTERVAL_SIMD_SIZE}"
+    );
+    let mut tiles = vec![];
+    for x in 0..size / TILE_SIZE {
+        for y in 0..size / TILE_SIZE {
+            tiles.push(Tile {
+                x: x * TILE_SIZE,
+                y: y * TILE_SIZE,
+            });
+        }
+    }
+    assert_eq!(
+        tiles.len() % INTERVAL_SIMD_SIZE as usize,
+        0,
+        "tile count must be divisible by {INTERVAL_SIMD_SIZE}"
+    );
+
+    let to_image_pos = |i: u32| -> f32 {
+        ((i as f32 - size as f32 / 2.0) / size as f32) * 2.0
+    };
+
+    let mut scratch_i = vec![];
+    let mut scratch_f = vec![];
+    let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
+    for ts in tiles.chunks(INTERVAL_SIMD_SIZE as usize) {
+        let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
+        let mut ys = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
+        for j in 0..INTERVAL_SIMD_SIZE as usize {
+            xs[j] = Interval::new(
+                to_image_pos(ts[j].x),
+                to_image_pos(ts[j].x + TILE_SIZE),
+            );
+            ys[j] = Interval::new(
+                to_image_pos(ts[j].y),
+                to_image_pos(ts[j].y + TILE_SIZE),
+            );
+        }
+        let (values, choices) = interval_i(ops, &mut scratch_i, xs, ys);
+        let next = simplify(ops, &choices);
+        for j in 0..INTERVAL_SIMD_SIZE as usize {
+            let fill = if values[j].upper() < 0.0 {
+                Some([255, 0, 0, 255])
+            } else if values[j].lower() > 0.0 {
+                Some([0, 255, 0, 255])
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
+                for iy in 0..TILE_SIZE {
+                    for ix in 0..TILE_SIZE {
+                        pixels[(ix
+                            + ts[j].x
+                            + (size - (iy + ts[j].y) - 1) * size)
+                            as usize] = fill;
+                    }
+                }
+                continue;
+            }
+            for iy in 0..TILE_SIZE {
+                let y = to_image_pos(iy + ts[j].y);
+                let ys = [y; FLOAT_SIMD_SIZE as usize];
+                for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
+                    let mut xs = [0.0; FLOAT_SIMD_SIZE as usize];
+                    for (k, x) in xs.iter_mut().enumerate() {
+                        *x = to_image_pos(
+                            ix * FLOAT_SIMD_SIZE + ts[j].x + k as u32,
+                        );
+                    }
+                    let vs = pixel_f(&next[j], &mut scratch_f, xs, ys);
+                    for k in 0..FLOAT_SIMD_SIZE as usize {
+                        pixels[(ix * FLOAT_SIMD_SIZE
+                            + ts[j].x
+                            + k as u32
+                            + (size - (iy + ts[j].y) - 1) * size)
+                            as usize] = shade(vs[k]);
+                    }
+                }
+            }
+        }
+    }
+    pixels
 }
 
 fn main() {
@@ -199,19 +577,51 @@ fn main() {
     let mut pixels = Vec::with_capacity((args.size as usize).pow(2));
     let mut scratch_f = vec![];
     let mut scratch_g = vec![];
-    for iy in (0..args.size).rev() {
-        let y = ((iy as f32) / (args.size as f32) - 0.5) * 2.0;
-        for ix in 0..args.size {
-            let x = ((ix as f32) / (args.size as f32) - 0.5) * 2.0;
-            let v = if args.normalize {
-                let g = pixel_g(&ops, &mut scratch_g, x, y);
-                g.v * 2.0 // condensed field lines
-            } else {
-                pixel_f(&ops, &mut scratch_f, x, y)
-            };
-            pixels.push(shade(v));
+
+    const WIDTH: usize = 16;
+    assert_eq!(
+        args.size % (WIDTH as u32),
+        0,
+        "image size must be a multiple of {WIDTH}"
+    );
+
+    let start_time = std::time::Instant::now();
+    for _ in 0..args.count {
+        if args.fancy {
+            pixels = render_multistage(&ops, args.size);
+        } else {
+            pixels.clear();
+            for iy in (0..args.size).rev() {
+                let y = ((iy as f32) / (args.size as f32) - 0.5) * 2.0;
+                let ys = [y; WIDTH];
+                for ix in 0..args.size / WIDTH as u32 {
+                    let mut xs = [0.0; WIDTH];
+                    for (j, x) in xs.iter_mut().enumerate() {
+                        *x = ((ix as f32 * WIDTH as f32 + j as f32)
+                            / (args.size as f32)
+                            - 0.5)
+                            * 2.0;
+                    }
+                    let vs = if args.normalize {
+                        let gs = pixel_g(&ops, &mut scratch_g, xs, ys);
+                        gs.map(|g| g.v * 2.0) // condensed field lines
+                    } else {
+                        pixel_f(&ops, &mut scratch_f, xs, ys)
+                    };
+                    for v in vs {
+                        pixels.push(shade(v));
+                    }
+                }
+            }
         }
     }
+    let elapsed = start_time.elapsed();
+    println!(
+        "Rendered {} in {:.2?} ({:.2?} / frame)",
+        args.count,
+        elapsed,
+        elapsed / args.count
+    );
 
     if let Some(out) = &args.out {
         let raw_pixels: Vec<u8> = pixels.into_iter().flatten().collect();
@@ -223,5 +633,5 @@ fn main() {
     println!("Hello, world!");
 }
 
-const PROSPERO: &'static str =
+const PROSPERO: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/prospero.txt"));
