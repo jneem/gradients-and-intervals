@@ -4,6 +4,7 @@ use fidget::{
     vm::Choice,
 };
 use image::{ImageBuffer, Rgba};
+use rayon::prelude::*;
 use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Copy, Clone, Debug)]
@@ -502,64 +503,74 @@ fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
         ((i as f32 - size as f32 / 2.0) / size as f32) * 2.0
     };
 
-    let mut scratch_i = vec![];
-    let mut scratch_f = vec![];
-    let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
-    for ts in tiles.chunks(INTERVAL_SIMD_SIZE as usize) {
-        let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
-        let mut ys = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
-        for j in 0..INTERVAL_SIMD_SIZE as usize {
-            xs[j] = Interval::new(
-                to_image_pos(ts[j].x),
-                to_image_pos(ts[j].x + TILE_SIZE),
-            );
-            ys[j] = Interval::new(
-                to_image_pos(ts[j].y),
-                to_image_pos(ts[j].y + TILE_SIZE),
-            );
-        }
-        let (values, choices) = interval_i(ops, &mut scratch_i, xs, ys);
-        let next = simplify(ops, &choices);
-        for j in 0..INTERVAL_SIMD_SIZE as usize {
-            let fill = if values[j].upper() < 0.0 {
-                Some([255, 0, 0, 255])
-            } else if values[j].lower() > 0.0 {
-                Some([0, 255, 0, 255])
-            } else {
-                None
-            };
-            if let Some(fill) = fill {
+    let out = tiles
+        .par_chunks(INTERVAL_SIMD_SIZE as usize)
+        .map(|ts| {
+            let mut out = vec![];
+            let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
+            let mut ys = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
+            let mut scratch_i = vec![];
+            let mut scratch_f = vec![];
+            for j in 0..INTERVAL_SIMD_SIZE as usize {
+                xs[j] = Interval::new(
+                    to_image_pos(ts[j].x),
+                    to_image_pos(ts[j].x + TILE_SIZE),
+                );
+                ys[j] = Interval::new(
+                    to_image_pos(ts[j].y),
+                    to_image_pos(ts[j].y + TILE_SIZE),
+                );
+            }
+            let (values, choices) = interval_i(ops, &mut scratch_i, xs, ys);
+            let next = simplify(ops, &choices);
+            for j in 0..INTERVAL_SIMD_SIZE as usize {
+                let fill = if values[j].upper() < 0.0 {
+                    Some([255, 0, 0, 255])
+                } else if values[j].lower() > 0.0 {
+                    Some([0, 255, 0, 255])
+                } else {
+                    None
+                };
+                if let Some(fill) = fill {
+                    for iy in 0..TILE_SIZE {
+                        for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
+                            out.push((
+                                ix * FLOAT_SIMD_SIZE
+                                    + ts[j].x
+                                    + (size - (iy + ts[j].y) - 1) * size,
+                                [fill; FLOAT_SIMD_SIZE as usize],
+                            ))
+                        }
+                    }
+                    continue;
+                }
                 for iy in 0..TILE_SIZE {
-                    for ix in 0..TILE_SIZE {
-                        pixels[(ix
-                            + ts[j].x
-                            + (size - (iy + ts[j].y) - 1) * size)
-                            as usize] = fill;
-                    }
-                }
-                continue;
-            }
-            for iy in 0..TILE_SIZE {
-                let y = to_image_pos(iy + ts[j].y);
-                let ys = [y; FLOAT_SIMD_SIZE as usize];
-                for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
-                    let mut xs = [0.0; FLOAT_SIMD_SIZE as usize];
-                    for (k, x) in xs.iter_mut().enumerate() {
-                        *x = to_image_pos(
-                            ix * FLOAT_SIMD_SIZE + ts[j].x + k as u32,
-                        );
-                    }
-                    let vs = pixel_f(&next[j], &mut scratch_f, xs, ys);
-                    for k in 0..FLOAT_SIMD_SIZE as usize {
-                        pixels[(ix * FLOAT_SIMD_SIZE
-                            + ts[j].x
-                            + k as u32
-                            + (size - (iy + ts[j].y) - 1) * size)
-                            as usize] = shade(vs[k]);
+                    let y = to_image_pos(iy + ts[j].y);
+                    let ys = [y; FLOAT_SIMD_SIZE as usize];
+                    for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
+                        let mut xs = [0.0; FLOAT_SIMD_SIZE as usize];
+                        for (k, x) in xs.iter_mut().enumerate() {
+                            *x = to_image_pos(
+                                ix * FLOAT_SIMD_SIZE + ts[j].x + k as u32,
+                            );
+                        }
+                        let vs = pixel_f(&next[j], &mut scratch_f, xs, ys);
+                        out.push((
+                            ix * FLOAT_SIMD_SIZE
+                                + ts[j].x
+                                + (size - (iy + ts[j].y) - 1) * size,
+                            vs.map(shade),
+                        ));
                     }
                 }
             }
-        }
+            out.into_iter()
+        })
+        .collect::<Vec<_>>();
+
+    let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
+    for (i, vs) in out.into_iter().flatten() {
+        pixels[i as usize..][..vs.len()].copy_from_slice(&vs);
     }
     pixels
 }
