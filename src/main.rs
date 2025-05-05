@@ -466,7 +466,7 @@ fn shade(f: f32) -> [u8; 4] {
 fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
     const TILE_SIZE: u32 = 32;
     const INTERVAL_SIMD_SIZE: u32 = 16;
-    const FLOAT_SIMD_SIZE: u32 = 16;
+    const FLOAT_SIMD_SIZE: u32 = 32;
     assert_eq!(
         TILE_SIZE % FLOAT_SIMD_SIZE,
         0,
