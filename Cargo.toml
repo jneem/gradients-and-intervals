@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5.37", features = ["derive"] }
 image = { version = "0.25.6", features = ["png"] }
-fidget = "0.3"
+# fidget = "0.3"
+fidget.path = "../fidget/fidget"
 rayon = "1.10.0"
 
 [profile.release]

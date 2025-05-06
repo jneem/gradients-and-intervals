@@ -103,10 +103,9 @@ fn pixel_f<const N: usize>(
     x: [f32; N],
     y: [f32; N],
 ) -> [f32; N] {
-    scratch.resize(
-        ops.last().map(|(i, _)| *i as usize).unwrap_or(0) + 1,
-        [f32::NAN; N],
-    );
+    scratch.resize(ops.len(), [f32::NAN; N]);
+    println!("{} ops", ops.len());
+    let mut const_count = 0;
     for (i, op) in ops {
         let i = *i as usize;
         match op {
@@ -154,6 +153,7 @@ fn pixel_f<const N: usize>(
                 }
             }
             Op::Const(f) => {
+                const_count += 1;
                 for j in 0..N {
                     scratch[i][j] = *f;
                 }
@@ -176,7 +176,8 @@ fn pixel_f<const N: usize>(
             }
         };
     }
-    scratch.last().cloned().unwrap_or([0.0; N])
+    println!("  {const_count} consts");
+    scratch[ops.last().unwrap().0 as usize]
 }
 
 /// Normalizes to a gradient of 1
@@ -270,7 +271,7 @@ fn pixel_g<const N: usize>(
             }
         };
     }
-    scratch.last().cloned().unwrap_or([Grad::from(0.0); N])
+    scratch[ops.last().unwrap().0 as usize]
 }
 
 fn interval_i<const N: usize>(
@@ -358,104 +359,153 @@ fn interval_i<const N: usize>(
             }
         };
     }
-    (
-        scratch.last().cloned().unwrap_or([Interval::from(0.0); N]),
-        choices,
-    )
+    (scratch[ops.last().unwrap().0 as usize], choices)
+}
+
+struct Simplify<const N: usize> {
+    active: Vec<[Option<u32>; N]>,
+    out: [Vec<(u32, Op)>; N],
+    next: [u32; N],
+}
+
+impl<const N: usize> Simplify<N> {
+    fn new() -> Self {
+        Self {
+            active: vec![],
+            out: [(); N].map(|()| vec![]),
+            next: [0; N],
+        }
+    }
+
+    /// Bind a register to the next available slot
+    fn bind(&mut self, index: u32, a: u32) -> u32 {
+        *self.active[a as usize][index as usize].get_or_insert_with(|| {
+            let v = self.next[index as usize];
+            self.next[index as usize] += 1;
+            v
+        })
+    }
+
+    fn simplify_unary(&mut self, i: u32, a: u32, f: fn(u32) -> Op) {
+        for j in 0..N as u32 {
+            if let Some(i) = self.active[i as usize][j as usize] {
+                let a = self.bind(j, a);
+                self.out[j as usize].push((i, f(a)));
+            }
+        }
+    }
+
+    fn simplify_binary(
+        &mut self,
+        i: u32,
+        a: u32,
+        b: u32,
+        f: fn(u32, u32) -> Op,
+    ) {
+        for j in 0..N as u32 {
+            if let Some(i) = self.active[i as usize][j as usize] {
+                let a = self.bind(j, a);
+                let b = self.bind(j, b);
+                self.out[j as usize].push((i, f(a, b)));
+            }
+        }
+    }
+
+    fn simplify_binary_choice(
+        &mut self,
+        i: u32,
+        a: u32,
+        b: u32,
+        cs: [Choice; N],
+        f: fn(u32, u32) -> Op,
+    ) {
+        for j in 0..N as u32 {
+            if let Some(i) = self.active[i as usize][j as usize] {
+                match cs[j as usize] {
+                    Choice::Left => {
+                        self.push_copy(j, i, a);
+                    }
+                    Choice::Right => {
+                        self.push_copy(j, i, b);
+                    }
+                    Choice::Both => {
+                        let a = self.bind(j, a);
+                        let b = self.bind(j, b);
+                        self.out[j as usize].push((i, f(a, b)));
+                    }
+                    Choice::Unknown => panic!(),
+                }
+            }
+        }
+    }
+
+    fn push_copy(&mut self, index: u32, i: u32, a: u32) {
+        if let Some(a) = self.active[a as usize][index as usize] {
+            self.out[index as usize].push((i, Op::Copy(a)));
+        } else {
+            self.active[a as usize][index as usize] = Some(i);
+        }
+    }
+
+    fn run(&mut self, ops: &[(u32, Op)], choices: &[[Choice; N]]) {
+        self.active.fill([None; N]);
+        self.active.resize(ops.len(), [None; N]);
+        self.next = [0; N];
+
+        let mut choices = choices.iter().rev();
+        if let Some((i, _op)) = ops.last() {
+            self.active[*i as usize] = [Some(0); N];
+            self.next = [1; N];
+        }
+
+        for (i, o) in ops.iter().rev() {
+            match o {
+                Op::Const(..) | Op::VarX | Op::VarY => {
+                    for (j, v) in self.out.iter_mut().enumerate() {
+                        if let Some(i) = self.active[*i as usize][j] {
+                            v.push((i, *o))
+                        }
+                    }
+                }
+                Op::Copy(a) => self.simplify_unary(*i, *a, Op::Copy),
+                Op::Sqrt(a) => self.simplify_unary(*i, *a, Op::Sqrt),
+                Op::Square(a) => self.simplify_unary(*i, *a, Op::Square),
+                Op::Neg(a) => self.simplify_unary(*i, *a, Op::Neg),
+                Op::Add(a, b) => self.simplify_binary(*i, *a, *b, Op::Add),
+                Op::Sub(a, b) => self.simplify_binary(*i, *a, *b, Op::Sub),
+                Op::Mul(a, b) => self.simplify_binary(*i, *a, *b, Op::Mul),
+                Op::Div(a, b) => self.simplify_binary(*i, *a, *b, Op::Div),
+                Op::Min(a, b) => self.simplify_binary_choice(
+                    *i,
+                    *a,
+                    *b,
+                    *choices.next().unwrap(),
+                    Op::Min,
+                ),
+                Op::Max(a, b) => self.simplify_binary_choice(
+                    *i,
+                    *a,
+                    *b,
+                    *choices.next().unwrap(),
+                    Op::Max,
+                ),
+            }
+        }
+        assert!(choices.next().is_none());
+
+        for a in self.out.iter_mut() {
+            a.reverse();
+        }
+    }
 }
 
 fn simplify<const N: usize>(
     ops: &[(u32, Op)],
     choices: &[[Choice; N]],
 ) -> [Vec<(u32, Op)>; N] {
-    let mut out = [(); N].map(|()| vec![]);
-    let mut active = vec![[0; N]; ops.len()];
-    let mut choices = choices.iter().rev();
-    if let Some(a) = active.last_mut() {
-        *a = [1; N];
-    }
-    let push_copy = |v: &mut Vec<(u32, Op)>, allowed: bool, i: u32, a: u32| {
-        if let Some((_i, Op::Copy(prev))) = v.last_mut() {
-            if allowed && *prev == i {
-                *prev = a;
-                return;
-            }
-        }
-        v.push((i, Op::Copy(a)));
-    };
-    for (i, o) in ops.iter().rev() {
-        match o {
-            Op::Const(..) | Op::VarX | Op::VarY => {
-                for (j, v) in out.iter_mut().enumerate() {
-                    if active[*i as usize][j] > 0 {
-                        v.push((*i, *o))
-                    }
-                }
-            }
-            Op::Copy(a) => {
-                for (j, v) in out.iter_mut().enumerate() {
-                    if active[*i as usize][j] > 0 {
-                        push_copy(v, active[*i as usize][j] == 1, *i, *a);
-                    }
-                }
-            }
-            Op::Sqrt(a) | Op::Square(a) | Op::Neg(a) => {
-                for (j, v) in out.iter_mut().enumerate() {
-                    if active[*i as usize][j] > 0 {
-                        active[*a as usize][j] += 1;
-                        v.push((*i, *o));
-                    }
-                }
-            }
-            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) => {
-                for (j, v) in out.iter_mut().enumerate() {
-                    if active[*i as usize][j] > 0 {
-                        active[*a as usize][j] += 1;
-                        active[*b as usize][j] += 1;
-                        v.push((*i, *o));
-                    }
-                }
-            }
-            Op::Min(a, b) | Op::Max(a, b) => {
-                let cs = choices.next().unwrap();
-                for (j, v) in out.iter_mut().enumerate() {
-                    if active[*i as usize][j] > 0 {
-                        match cs[j] {
-                            Choice::Left => {
-                                active[*a as usize][j] += 1;
-                                push_copy(
-                                    v,
-                                    active[*i as usize][j] == 1,
-                                    *i,
-                                    *a,
-                                );
-                            }
-                            Choice::Right => {
-                                active[*b as usize][j] += 1;
-                                push_copy(
-                                    v,
-                                    active[*i as usize][j] == 1,
-                                    *i,
-                                    *b,
-                                );
-                            }
-                            Choice::Both => {
-                                active[*a as usize][j] += 1;
-                                active[*b as usize][j] += 1;
-                                v.push((*i, *o))
-                            }
-                            Choice::Unknown => panic!(),
-                        }
-                    }
-                }
-            }
-        }
-    }
-    assert!(choices.next().is_none());
-    for a in &mut out {
-        a.reverse()
-    }
-    out
+    let mut worker = Simplify::new();
+    worker.run(ops, choices);
+    worker.out
 }
 
 fn shade(f: f32) -> [u8; 4] {
@@ -465,9 +515,9 @@ fn shade(f: f32) -> [u8; 4] {
 }
 
 fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
-    const TILE_SIZE: u32 = 32;
-    const INTERVAL_SIMD_SIZE: u32 = 16;
-    const FLOAT_SIMD_SIZE: u32 = 32;
+    const TILE_SIZE: u32 = 16;
+    const INTERVAL_SIMD_SIZE: u32 = 4;
+    const FLOAT_SIMD_SIZE: u32 = 16;
     assert_eq!(
         TILE_SIZE % FLOAT_SIMD_SIZE,
         0,
@@ -504,7 +554,7 @@ fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
     };
 
     let out = tiles
-        .par_chunks(INTERVAL_SIMD_SIZE as usize)
+        .chunks(INTERVAL_SIMD_SIZE as usize)
         .map(|ts| {
             let mut out = vec![];
             let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
