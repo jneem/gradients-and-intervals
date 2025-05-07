@@ -526,6 +526,7 @@ dependencies = [
 [[package]]
 name = "fidget"
 version = "0.3.7"
+source = "git+https://github.com/mkeeter/fidget#a3f05be4f515339f6680a25b8eca96a142bf066e"
 dependencies = [
  "arrayvec",
  "bimap",
@@ -1096,6 +1097,7 @@ dependencies = [
  "clap",
  "fidget",
  "image",
+ "ordered-float",
  "rayon",
 ]
 
@@ -1946,6 +1948,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
+source = "git+https://github.com/mkeeter/fidget#a3f05be4f515339f6680a25b8eca96a142bf066e"
 dependencies = [
  "ahash",
  "anstream",

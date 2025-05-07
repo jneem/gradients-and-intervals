@@ -1,0 +1,8 @@
+x var-x
+x2 square x
+y var-y
+y2 square y
+r2 add x2 y2
+r sqrt r2
+v const 0.5
+out sub r v
