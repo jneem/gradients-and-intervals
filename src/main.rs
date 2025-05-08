@@ -119,57 +119,77 @@ struct Args {
     count: u32,
 }
 
+struct Slots<T, const N: usize> {
+    slots: Vec<[T; N]>,
+}
+
+impl<T: Copy + Clone + From<f32>, const N: usize> Slots<T, N> {
+    fn new() -> Self {
+        Self { slots: vec![] }
+    }
+    fn resize(&mut self, capacity: usize) {
+        self.slots.resize(capacity, [T::from(f32::NAN); N])
+    }
+}
+
+impl<T, const N: usize> std::ops::Index<u16> for Slots<T, N> {
+    type Output = [T; N];
+    fn index(&self, index: u16) -> &Self::Output {
+        &self.slots[index as usize]
+    }
+}
+
+impl<T, const N: usize> std::ops::IndexMut<u16> for Slots<T, N> {
+    fn index_mut(&mut self, index: u16) -> &mut Self::Output {
+        &mut self.slots[index as usize]
+    }
+}
+
 fn pixel_f<const N: usize>(
     ops: &[(u16, Op)],
-    scratch: &mut Vec<[f32; N]>,
+    scratch: &mut Slots<f32, N>,
     x: [f32; N],
     y: [f32; N],
 ) -> [f32; N] {
-    scratch.resize(ops.len(), [f32::NAN; N]);
+    scratch.resize(ops.len());
     for (i, op) in ops {
-        let i = *i as usize;
+        let i = *i;
         match op {
             Op::VarX => scratch[i] = x,
             Op::VarY => scratch[i] = y,
-            Op::Copy(a) => scratch[i] = scratch[*a as usize],
+            Op::Copy(a) => scratch[i] = scratch[*a],
             Op::Add(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] =
-                        scratch[*a as usize][j] + scratch[*b as usize][j]
+                    scratch[i][j] = scratch[*a][j] + scratch[*b][j]
                 }
             }
             Op::Sub(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] =
-                        scratch[*a as usize][j] - scratch[*b as usize][j]
+                    scratch[i][j] = scratch[*a][j] - scratch[*b][j]
                 }
             }
             Op::Mul(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] =
-                        scratch[*a as usize][j] * scratch[*b as usize][j]
+                    scratch[i][j] = scratch[*a][j] * scratch[*b][j]
                 }
             }
             Op::Div(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] =
-                        scratch[*a as usize][j] / scratch[*b as usize][j]
+                    scratch[i][j] = scratch[*a][j] / scratch[*b][j]
                 }
             }
             Op::Max(a, b) => {
                 for j in 0..N {
-                    assert!(!scratch[*a as usize][j].is_nan());
-                    assert!(!scratch[*b as usize][j].is_nan());
-                    scratch[i][j] =
-                        scratch[*a as usize][j].max(scratch[*b as usize][j])
+                    assert!(!scratch[*a][j].is_nan());
+                    assert!(!scratch[*b][j].is_nan());
+                    scratch[i][j] = scratch[*a][j].max(scratch[*b][j])
                 }
             }
             Op::Min(a, b) => {
                 for j in 0..N {
-                    assert!(!scratch[*a as usize][j].is_nan());
-                    assert!(!scratch[*b as usize][j].is_nan());
-                    scratch[i][j] =
-                        scratch[*a as usize][j].min(scratch[*b as usize][j])
+                    assert!(!scratch[*a][j].is_nan());
+                    assert!(!scratch[*b][j].is_nan());
+                    scratch[i][j] = scratch[*a][j].min(scratch[*b][j])
                 }
             }
             Op::Const(f) => {
@@ -179,23 +199,23 @@ fn pixel_f<const N: usize>(
             }
             Op::Square(a) => {
                 for j in 0..N {
-                    let v = scratch[*a as usize][j];
+                    let v = scratch[*a][j];
                     scratch[i][j] = v * v;
                 }
             }
             Op::Neg(a) => {
                 for j in 0..N {
-                    scratch[i][j] = -scratch[*a as usize][j];
+                    scratch[i][j] = -scratch[*a][j];
                 }
             }
             Op::Sqrt(a) => {
                 for j in 0..N {
-                    scratch[i][j] = scratch[*a as usize][j].sqrt();
+                    scratch[i][j] = scratch[*a][j].sqrt();
                 }
             }
         };
     }
-    scratch[ops.last().unwrap().0 as usize]
+    scratch[ops.last().unwrap().0]
 }
 
 /// Normalizes to a gradient of 1
@@ -294,7 +314,7 @@ fn pixel_g<const N: usize>(
 
 fn float_tile<const N: usize>(
     ops: &[(u16, Op)],
-    scratch: &mut Vec<[f32; N]>,
+    scratch: &mut Slots<f32, N>,
     x: Interval,
     y: Interval,
 ) -> [f32; N] {
@@ -521,7 +541,7 @@ impl<const N: usize> Simplify<N> {
         self.active.fill([None; N]);
         self.active.resize(ops.len(), [None; N]);
         self.next = [0; N];
-        self.out = [(); N].map(|()| Vec::with_capacity(ops.len()));
+        self.out = [(); N].map(|()| Vec::with_capacity(ops.len() / 2));
 
         let mut choices = choices.iter().rev();
         if let Some((i, _op)) = ops.last() {
@@ -588,7 +608,7 @@ fn shade(f: f32) -> [u8; 4] {
 fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
-    let mut scratch_f = vec![];
+    let mut scratch_f = Slots::new();
     let bounds = Interval::new(-1.0, 1.0);
     let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
     let mut fill = |x: u32, y: u32, tile_size: u32, color| {
@@ -785,7 +805,7 @@ fn render_multistage(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
             let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
             let mut ys = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
             let mut scratch_i = vec![];
-            let mut scratch_f = vec![];
+            let mut scratch_f = Slots::new();
             for j in 0..INTERVAL_SIMD_SIZE as usize {
                 xs[j] = Interval::new(
                     to_image_pos(ts[j].x),
@@ -870,7 +890,7 @@ fn main() {
     };
 
     let mut pixels = Vec::with_capacity((args.size as usize).pow(2));
-    let mut scratch_f = vec![];
+    let mut scratch_f = Slots::new();
     let mut scratch_g = vec![];
 
     const WIDTH: usize = 16;
