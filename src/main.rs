@@ -11,8 +11,8 @@ use std::{collections::HashMap, path::PathBuf};
 enum Op {
     VarX,
     VarY,
-    Copy(u16),
     Const(ordered_float::OrderedFloat<f32>),
+    Copy(u16),
     Square(u16),
     Neg(u16),
     Sqrt(u16),
@@ -312,6 +312,7 @@ fn pixel_g<const N: usize>(
     scratch[ops.last().unwrap().0 as usize]
 }
 
+#[inline(never)]
 fn float_tile<const N: usize>(
     ops: &[(u16, Op)],
     scratch: &mut Slots<f32, N>,
@@ -434,6 +435,7 @@ fn interval_i<const N: usize>(
             Op::Square(a) => {
                 for j in 0..N {
                     let v = scratch[*a as usize][j];
+                    println!("{} {}", v.square(), v * v);
                     scratch[i][j] = v.square();
                 }
             }
@@ -605,276 +607,173 @@ fn shade(f: f32) -> [u8; 4] {
     [r, g, b, 255]
 }
 
+struct Tile<'a> {
+    x: u32,
+    y: u32,
+    tile_size: u32,
+    image_size: u32,
+    tape: std::borrow::Cow<'a, [(u16, Op)]>,
+}
+
+struct Fill {
+    x: u32,
+    y: u32,
+    tile_size: u32,
+    image_size: u32,
+    fill_color: [u8; 4],
+    edge_color: [u8; 4],
+}
+
+impl Fill {
+    fn run(&self, pixels: &mut [[u8; 4]]) {
+        for j in 0..self.tile_size {
+            for i in 0..self.tile_size {
+                let k = (self.image_size - (self.y + j) - 1) * self.image_size
+                    + self.x
+                    + i;
+                if i == 0
+                    || i == self.tile_size - 1
+                    || j == 0
+                    || j == self.tile_size - 1
+                {
+                    pixels[k as usize] = self.edge_color;
+                } else {
+                    pixels[k as usize] = self.fill_color;
+                }
+            }
+        }
+    }
+}
+
+enum Next<'a> {
+    Tile(Tile<'a>),
+    Fill(Fill),
+}
+
+impl Tile<'_> {
+    fn run(self, scratch: &mut Vec<[Interval; 16]>, out: &mut Vec<Next>) {
+        let bounds = Interval::new(-1.0, 1.0);
+        let ix = Interval::new(
+            bounds.lerp(self.x as f32 / self.image_size as f32),
+            bounds.lerp(
+                (self.x + self.tile_size) as f32 / self.image_size as f32,
+            ),
+        );
+        let iy = Interval::new(
+            bounds.lerp(self.y as f32 / self.image_size as f32),
+            bounds.lerp(
+                (self.y + self.tile_size) as f32 / self.image_size as f32,
+            ),
+        );
+        let (values, choices) =
+            interval_split::<16>(&self.tape, scratch, ix, iy);
+        let mut simplified = simplify(&self.tape, &choices);
+        for j in 0..4 {
+            for i in 0..4 {
+                let k = j * 4 + i;
+                let x = self.x + i as u32 * self.tile_size / 4;
+                let y = self.y + j as u32 * self.tile_size / 4;
+                let tile_size = self.tile_size / 4;
+                if values[k].contains(0.0) || values[k].has_nan() {
+                    out.push(Next::Tile(Tile {
+                        x,
+                        y,
+                        tile_size,
+                        image_size: self.image_size,
+                        tape: std::borrow::Cow::Owned(std::mem::take(
+                            &mut simplified[k],
+                        )),
+                    }));
+                } else {
+                    if tile_size == 128 {
+                        println!("{ix} {iy} => {}", values[k]);
+                    }
+                    out.push(Next::Fill(Fill {
+                        x,
+                        y,
+                        tile_size,
+                        image_size: self.image_size,
+                        fill_color: if values[k].upper() < 0.0 {
+                            [200, 200, 200, 255]
+                        } else {
+                            [50, 50, 50, 255]
+                        },
+                        edge_color: if values[k].upper() < 0.0 {
+                            [180, 180, 180, 255]
+                        } else {
+                            [20, 20, 20, 255]
+                        },
+                    }))
+                }
+            }
+        }
+    }
+}
+
 fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
     let mut scratch_f = Slots::new();
     let bounds = Interval::new(-1.0, 1.0);
     let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
-    let mut fill = |x: u32, y: u32, tile_size: u32, color| {
-        for j in 0..tile_size {
-            for i in 0..tile_size {
-                let k = (size - (y + j) - 1) * size + x + i;
-                pixels[k as usize] = color;
-            }
-        }
-    };
 
     // Render a set of 128x128 interval regions
-    let mut next = vec![];
+    let mut tiles = vec![];
     for x in 0..size / 512 {
         let x = x * 512;
         for y in 0..size / 512 {
             let y = y * 512;
-            let ix = Interval::new(
-                bounds.lerp(x as f32 / size as f32),
-                bounds.lerp((x + 512) as f32 / size as f32),
-            );
-            let iy = Interval::new(
-                bounds.lerp(y as f32 / size as f32),
-                bounds.lerp((y + 512) as f32 / size as f32),
-            );
-            let (values, choices) =
-                interval_split::<16>(ops, &mut scratch_i, ix, iy);
-            let mut simplified = simplify(ops, &choices);
-            for j in 0..4 {
-                for i in 0..4 {
-                    let k = j * 4 + i;
-                    if values[k].contains(0.0) {
-                        next.push((
-                            x + i as u32 * 128,
-                            y + j as u32 * 128,
-                            std::mem::take(&mut simplified[k]),
-                        ));
-                    } else {
-                        fill(
-                            x + i as u32 * 128,
-                            y + j as u32 * 128,
-                            128,
-                            [128, 128, 128, 255],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Render 32x32 interval regions
-    let tiles = next;
-    let mut next = vec![];
-    for (x, y, tape) in tiles {
-        let ix = Interval::new(
-            bounds.lerp(x as f32 / size as f32),
-            bounds.lerp((x + 128) as f32 / size as f32),
-        );
-        let iy = Interval::new(
-            bounds.lerp(y as f32 / size as f32),
-            bounds.lerp((y + 128) as f32 / size as f32),
-        );
-        let (values, choices) =
-            interval_split::<16>(&tape, &mut scratch_i, ix, iy);
-        let mut simplified = simplify(&tape, &choices);
-        for j in 0..4 {
-            for i in 0..4 {
-                let k = j * 4 + i;
-                if values[k].contains(0.0) {
-                    next.push((
-                        x + i as u32 * 32,
-                        y + j as u32 * 32,
-                        std::mem::take(&mut simplified[k]),
-                    ));
-                } else {
-                    fill(
-                        x + i as u32 * 32,
-                        y + j as u32 * 32,
-                        32,
-                        [255, 128, 128, 255],
-                    );
-                }
-            }
-        }
-    }
-
-    // Render 8x8 interval regions
-    let tiles = next;
-    let mut next = vec![];
-    for (x, y, tape) in tiles {
-        let ix = Interval::new(
-            bounds.lerp(x as f32 / size as f32),
-            bounds.lerp((x + 32) as f32 / size as f32),
-        );
-        let iy = Interval::new(
-            bounds.lerp(y as f32 / size as f32),
-            bounds.lerp((y + 32) as f32 / size as f32),
-        );
-        let (values, choices) =
-            interval_split::<16>(&tape, &mut scratch_i, ix, iy);
-        let mut simplified = simplify(&tape, &choices);
-        for j in 0..4 {
-            for i in 0..4 {
-                let k = j * 4 + i;
-                if values[k].contains(0.0) {
-                    next.push((
-                        x + i as u32 * 8,
-                        y + j as u32 * 8,
-                        std::mem::take(&mut simplified[k]),
-                    ));
-                } else {
-                    fill(
-                        x + i as u32 * 8,
-                        y + j as u32 * 8,
-                        8,
-                        [255, 255, 128, 255],
-                    );
-                }
-            }
-        }
-    }
-
-    // Render 8x8 tiles
-    let tiles = next;
-    let mut next = vec![];
-    for (x, y, tape) in tiles {
-        let ix = Interval::new(
-            bounds.lerp(x as f32 / size as f32),
-            bounds.lerp((x + 8) as f32 / size as f32),
-        );
-        let iy = Interval::new(
-            bounds.lerp(y as f32 / size as f32),
-            bounds.lerp((y + 8) as f32 / size as f32),
-        );
-        let vs = float_tile::<64>(&tape, &mut scratch_f, ix, iy);
-        next.push((x, y, vs));
-    }
-
-    for (x, y, vs) in next {
-        for j in 0..8 {
-            for i in 0..8 {
-                let k = j * 8 + i;
-                let p = (size - (y + j) - 1) * size + x + i;
-                pixels[p as usize] = shade(vs[k as usize]);
-            }
-        }
-    }
-    pixels
-}
-
-fn render_multistage(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
-    const TILE_SIZE: u32 = 32;
-    const INTERVAL_SIMD_SIZE: u32 = 16;
-    const FLOAT_SIMD_SIZE: u32 = 32;
-    assert_eq!(
-        TILE_SIZE % FLOAT_SIMD_SIZE,
-        0,
-        "chunk size must be divisible by SIMD size"
-    );
-
-    #[derive(Debug)]
-    struct Tile {
-        x: u32,
-        y: u32,
-    }
-    assert_eq!(
-        size % INTERVAL_SIMD_SIZE,
-        0,
-        "image size must be divisible by {INTERVAL_SIMD_SIZE}"
-    );
-    let mut tiles = vec![];
-    for x in 0..size / TILE_SIZE {
-        for y in 0..size / TILE_SIZE {
             tiles.push(Tile {
-                x: x * TILE_SIZE,
-                y: y * TILE_SIZE,
+                x,
+                y,
+                tile_size: 512,
+                image_size: size,
+                tape: std::borrow::Cow::Borrowed(ops),
             });
         }
     }
-    assert_eq!(
-        tiles.len() % INTERVAL_SIMD_SIZE as usize,
-        0,
-        "tile count must be divisible by {INTERVAL_SIMD_SIZE}"
-    );
 
-    let to_image_pos = |i: u32| -> f32 {
-        ((i as f32 - size as f32 / 2.0) / size as f32) * 2.0
-    };
-
-    let out = tiles
-        .chunks(INTERVAL_SIMD_SIZE as usize)
-        .map(|ts| {
-            let mut out = vec![];
-            let mut xs = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
-            let mut ys = [Interval::from(0.0); INTERVAL_SIMD_SIZE as usize];
-            let mut scratch_i = vec![];
-            let mut scratch_f = Slots::new();
-            for j in 0..INTERVAL_SIMD_SIZE as usize {
-                xs[j] = Interval::new(
-                    to_image_pos(ts[j].x),
-                    to_image_pos(ts[j].x + TILE_SIZE),
-                );
-                ys[j] = Interval::new(
-                    to_image_pos(ts[j].y),
-                    to_image_pos(ts[j].y + TILE_SIZE),
-                );
+    // 512, 128, 32
+    for _ in 0..3 {
+        let mut next = vec![];
+        for t in tiles {
+            t.run(&mut scratch_i, &mut next);
+        }
+        tiles = vec![];
+        for n in next {
+            match n {
+                Next::Tile(t) => tiles.push(t),
+                Next::Fill(f) => f.run(&mut pixels),
             }
-            let (values, choices) = interval_i(ops, &mut scratch_i, xs, ys);
-            let next = if values.iter().any(|v| v.contains(0.0)) {
-                Some(simplify(ops, &choices))
-            } else {
-                None
-            };
-            for j in 0..INTERVAL_SIMD_SIZE as usize {
-                let fill = if values[j].upper() < 0.0 {
-                    Some([255, 0, 0, 255])
-                } else if values[j].lower() > 0.0 {
-                    Some([0, 255, 0, 255])
+        }
+    }
+
+    let mut next = vec![];
+    for t in tiles {
+        let ix = Interval::new(
+            bounds.lerp(t.x as f32 / t.image_size as f32),
+            bounds.lerp((t.x + t.tile_size) as f32 / t.image_size as f32),
+        );
+        let iy = Interval::new(
+            bounds.lerp(t.y as f32 / t.image_size as f32),
+            bounds.lerp((t.y + 8) as f32 / t.image_size as f32),
+        );
+        let vs = float_tile::<64>(&t.tape, &mut scratch_f, ix, iy);
+        next.push((t.x, t.y, t.tile_size, vs));
+    }
+
+    for (x, y, tile_size, vs) in next {
+        for j in 0..tile_size {
+            for i in 0..tile_size {
+                let k = j * tile_size + i;
+                let p = (size - (y + j) - 1) * size + x + i;
+                pixels[p as usize] = if vs[k as usize] < 0.0 {
+                    [255; 4]
                 } else {
-                    None
+                    [0, 0, 0, 255]
                 };
-                if let Some(fill) = fill {
-                    for iy in 0..TILE_SIZE {
-                        for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
-                            out.push((
-                                ix * FLOAT_SIMD_SIZE
-                                    + ts[j].x
-                                    + (size - (iy + ts[j].y) - 1) * size,
-                                [fill; FLOAT_SIMD_SIZE as usize],
-                            ))
-                        }
-                    }
-                    continue;
-                }
-                for iy in 0..TILE_SIZE {
-                    let y = to_image_pos(iy + ts[j].y);
-                    let ys = [y; FLOAT_SIMD_SIZE as usize];
-                    for ix in 0..TILE_SIZE / FLOAT_SIMD_SIZE {
-                        let mut xs = [0.0; FLOAT_SIMD_SIZE as usize];
-                        for (k, x) in xs.iter_mut().enumerate() {
-                            *x = to_image_pos(
-                                ix * FLOAT_SIMD_SIZE + ts[j].x + k as u32,
-                            );
-                        }
-                        let vs = pixel_f(
-                            &next.as_ref().unwrap()[j],
-                            &mut scratch_f,
-                            xs,
-                            ys,
-                        );
-                        out.push((
-                            ix * FLOAT_SIMD_SIZE
-                                + ts[j].x
-                                + (size - (iy + ts[j].y) - 1) * size,
-                            vs.map(shade),
-                        ));
-                    }
-                }
             }
-            out.into_iter()
-        })
-        .collect::<Vec<_>>();
-
-    let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
-    for (i, vs) in out.into_iter().flatten() {
-        pixels[i as usize..][..vs.len()].copy_from_slice(&vs);
+        }
     }
     pixels
 }
