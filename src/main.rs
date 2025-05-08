@@ -11,30 +11,30 @@ use std::{collections::HashMap, path::PathBuf};
 enum Op {
     VarX,
     VarY,
-    Copy(u32),
+    Copy(u16),
     Const(ordered_float::OrderedFloat<f32>),
-    Square(u32),
-    Neg(u32),
-    Sqrt(u32),
-    Add(u32, u32),
-    Sub(u32, u32),
-    Div(u32, u32),
-    Mul(u32, u32),
-    Max(u32, u32),
-    Min(u32, u32),
+    Square(u16),
+    Neg(u16),
+    Sqrt(u16),
+    Add(u16, u16),
+    Sub(u16, u16),
+    Div(u16, u16),
+    Mul(u16, u16),
+    Max(u16, u16),
+    Min(u16, u16),
 }
 
-fn parse(s: &str) -> Vec<(u32, Op)> {
+fn parse(s: &str) -> Vec<(u16, Op)> {
     let mut ops = vec![];
 
     #[derive(Default)]
-    struct Slots<'a>(HashMap<&'a str, u32>);
+    struct Slots<'a>(HashMap<&'a str, u16>);
     impl<'a> Slots<'a> {
-        fn get(&mut self, arg: &'a str) -> u32 {
-            let i = u32::try_from(self.0.len()).unwrap();
+        fn get(&mut self, arg: &'a str) -> u16 {
+            let i = u16::try_from(self.0.len()).unwrap();
             *self.0.entry(arg).or_insert(i)
         }
-        fn put(&mut self, s: &'a str, v: u32) {
+        fn put(&mut self, s: &'a str, v: u16) {
             let prev = self.0.insert(s, v);
             assert!(prev.is_none());
         }
@@ -120,7 +120,7 @@ struct Args {
 }
 
 fn pixel_f<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     scratch: &mut Vec<[f32; N]>,
     x: [f32; N],
     y: [f32; N],
@@ -210,7 +210,7 @@ pub fn normalize(g: Grad) -> Grad {
 }
 
 fn pixel_g<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     scratch: &mut Vec<[Grad; N]>,
     x: [f32; N],
     y: [f32; N],
@@ -293,7 +293,7 @@ fn pixel_g<const N: usize>(
 }
 
 fn float_tile<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     scratch: &mut Vec<[f32; N]>,
     x: Interval,
     y: Interval,
@@ -316,7 +316,7 @@ fn float_tile<const N: usize>(
 }
 
 fn interval_split<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     scratch: &mut Vec<[Interval; N]>,
     x: Interval,
     y: Interval,
@@ -345,7 +345,7 @@ fn interval_split<const N: usize>(
 }
 
 fn interval_i<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     scratch: &mut Vec<[Interval; N]>,
     x: [Interval; N],
     y: [Interval; N],
@@ -433,9 +433,9 @@ fn interval_i<const N: usize>(
 }
 
 struct Simplify<const N: usize> {
-    active: Vec<[Option<u32>; N]>,
-    out: [Vec<(u32, Op)>; N],
-    next: [u32; N],
+    active: Vec<[Option<u16>; N]>,
+    out: [Vec<(u16, Op)>; N],
+    next: [u16; N],
 }
 
 impl<const N: usize> Simplify<N> {
@@ -448,50 +448,50 @@ impl<const N: usize> Simplify<N> {
     }
 
     /// Bind a register to the next available slot
-    fn bind(&mut self, index: u32, a: u32) -> u32 {
-        *self.active[a as usize][index as usize].get_or_insert_with(|| {
-            let v = self.next[index as usize];
-            self.next[index as usize] += 1;
+    fn bind(&mut self, index: usize, a: u16) -> u16 {
+        *self.active[a as usize][index].get_or_insert_with(|| {
+            let v = self.next[index];
+            self.next[index] += 1;
             v
         })
     }
 
-    fn simplify_unary(&mut self, i: u32, a: u32, f: fn(u32) -> Op) {
-        for j in 0..N as u32 {
-            if let Some(i) = self.active[i as usize][j as usize] {
+    fn simplify_unary(&mut self, i: u16, a: u16, f: fn(u16) -> Op) {
+        for j in 0..N {
+            if let Some(i) = self.active[i as usize][j] {
                 let a = self.bind(j, a);
-                self.out[j as usize].push((i, f(a)));
+                self.out[j].push((i, f(a)));
             }
         }
     }
 
     fn simplify_binary(
         &mut self,
-        i: u32,
-        a: u32,
-        b: u32,
-        f: fn(u32, u32) -> Op,
+        i: u16,
+        a: u16,
+        b: u16,
+        f: fn(u16, u16) -> Op,
     ) {
-        for j in 0..N as u32 {
-            if let Some(i) = self.active[i as usize][j as usize] {
+        for j in 0..N {
+            if let Some(i) = self.active[i as usize][j] {
                 let a = self.bind(j, a);
                 let b = self.bind(j, b);
-                self.out[j as usize].push((i, f(a, b)));
+                self.out[j].push((i, f(a, b)));
             }
         }
     }
 
     fn simplify_binary_choice(
         &mut self,
-        i: u32,
-        a: u32,
-        b: u32,
+        i: u16,
+        a: u16,
+        b: u16,
         cs: [Choice; N],
-        f: fn(u32, u32) -> Op,
+        f: fn(u16, u16) -> Op,
     ) {
-        for j in 0..N as u32 {
-            if let Some(i) = self.active[i as usize][j as usize] {
-                match cs[j as usize] {
+        for (j, c) in cs.iter().enumerate() {
+            if let Some(i) = self.active[i as usize][j] {
+                match *c {
                     Choice::Left => {
                         self.push_copy(j, i, a);
                     }
@@ -501,7 +501,7 @@ impl<const N: usize> Simplify<N> {
                     Choice::Both => {
                         let a = self.bind(j, a);
                         let b = self.bind(j, b);
-                        self.out[j as usize].push((i, f(a, b)));
+                        self.out[j].push((i, f(a, b)));
                     }
                     Choice::Unknown => panic!(),
                 }
@@ -509,15 +509,15 @@ impl<const N: usize> Simplify<N> {
         }
     }
 
-    fn push_copy(&mut self, index: u32, i: u32, a: u32) {
-        if let Some(a) = self.active[a as usize][index as usize] {
-            self.out[index as usize].push((i, Op::Copy(a)));
+    fn push_copy(&mut self, index: usize, i: u16, a: u16) {
+        if let Some(a) = self.active[a as usize][index] {
+            self.out[index].push((i, Op::Copy(a)));
         } else {
-            self.active[a as usize][index as usize] = Some(i);
+            self.active[a as usize][index] = Some(i);
         }
     }
 
-    fn run(&mut self, ops: &[(u32, Op)], choices: &[[Choice; N]]) {
+    fn run(&mut self, ops: &[(u16, Op)], choices: &[[Choice; N]]) {
         self.active.fill([None; N]);
         self.active.resize(ops.len(), [None; N]);
         self.next = [0; N];
@@ -571,9 +571,9 @@ impl<const N: usize> Simplify<N> {
 }
 
 fn simplify<const N: usize>(
-    ops: &[(u32, Op)],
+    ops: &[(u16, Op)],
     choices: &[[Choice; N]],
-) -> [Vec<(u32, Op)>; N] {
+) -> [Vec<(u16, Op)>; N] {
     let mut worker = Simplify::new();
     worker.run(ops, choices);
     worker.out
@@ -585,7 +585,7 @@ fn shade(f: f32) -> [u8; 4] {
     [r, g, b, 255]
 }
 
-fn render_recursive(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
+fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
     let mut scratch_f = vec![];
@@ -739,7 +739,7 @@ fn render_recursive(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
     pixels
 }
 
-fn render_multistage(ops: &[(u32, Op)], size: u32) -> Vec<[u8; 4]> {
+fn render_multistage(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
     const TILE_SIZE: u32 = 32;
     const INTERVAL_SIMD_SIZE: u32 = 16;
     const FLOAT_SIMD_SIZE: u32 = 32;
