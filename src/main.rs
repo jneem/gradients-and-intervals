@@ -150,13 +150,14 @@ fn pixel_f<const N: usize>(
     scratch: &mut Slots<f32, N>,
     x: [f32; N],
     y: [f32; N],
+    scale: f32,
 ) -> [f32; N] {
     scratch.resize(ops.len());
     for (i, op) in ops {
         let i = *i;
         match op {
-            Op::VarX => scratch[i] = x,
-            Op::VarY => scratch[i] = y,
+            Op::VarX => scratch[i] = x.map(|x| x * scale),
+            Op::VarY => scratch[i] = y.map(|y| y * scale),
             Op::Copy(a) => scratch[i] = scratch[*a],
             Op::Add(a, b) => {
                 for j in 0..N {
@@ -234,6 +235,7 @@ fn pixel_g<const N: usize>(
     scratch: &mut Vec<[Grad; N]>,
     x: [f32; N],
     y: [f32; N],
+    scale: f32,
 ) -> [Grad; N] {
     scratch.resize(ops.len(), [Grad::from(0.0); N]);
     for (i, op) in ops {
@@ -241,12 +243,12 @@ fn pixel_g<const N: usize>(
         match op {
             Op::VarX => {
                 for (j, x) in x.iter().enumerate() {
-                    scratch[i][j] = Grad::new(*x, 1.0, 0.0, 0.0)
+                    scratch[i][j] = Grad::new(*x * scale, 1.0, 0.0, 0.0)
                 }
             }
             Op::VarY => {
                 for (j, y) in y.iter().enumerate() {
-                    scratch[i][j] = Grad::new(*y, 0.0, 1.0, 0.0)
+                    scratch[i][j] = Grad::new(*y * scale, 0.0, 1.0, 0.0)
                 }
             }
             Op::Copy(a) => scratch[i] = scratch[*a as usize],
@@ -318,6 +320,7 @@ fn float_tile<const N: usize>(
     scratch: &mut Slots<f32, N>,
     x: Interval,
     y: Interval,
+    scale: f32,
 ) -> [f32; N] {
     let side = (N as f64).sqrt() as usize;
     assert_eq!(side * side, N);
@@ -333,7 +336,7 @@ fn float_tile<const N: usize>(
             k += 1;
         }
     }
-    pixel_f(ops, scratch, xs, ys)
+    pixel_f(ops, scratch, xs, ys, scale)
 }
 
 fn interval_split<const N: usize>(
@@ -341,6 +344,7 @@ fn interval_split<const N: usize>(
     scratch: &mut Vec<[Interval; N]>,
     x: Interval,
     y: Interval,
+    scale: f32,
 ) -> ([Interval; N], Vec<[Choice; N]>) {
     let side = (N as f64).sqrt() as usize;
     assert_eq!(side * side, N);
@@ -362,7 +366,7 @@ fn interval_split<const N: usize>(
             k += 1;
         }
     }
-    interval_i(ops, scratch, xs, ys)
+    interval_i(ops, scratch, xs, ys, scale)
 }
 
 fn interval_i<const N: usize>(
@@ -370,6 +374,7 @@ fn interval_i<const N: usize>(
     scratch: &mut Vec<[Interval; N]>,
     x: [Interval; N],
     y: [Interval; N],
+    scale: f32,
 ) -> ([Interval; N], Vec<[Choice; N]>) {
     scratch.resize(ops.len(), [Interval::from(0.0); N]);
     let mut choices = vec![];
@@ -377,10 +382,10 @@ fn interval_i<const N: usize>(
         let i = *i as usize;
         match op {
             Op::VarX => {
-                scratch[i] = x;
+                scratch[i] = x.map(|x| x * scale);
             }
             Op::VarY => {
-                scratch[i] = y;
+                scratch[i] = y.map(|y| y * scale);
             }
             Op::Copy(a) => scratch[i] = scratch[*a as usize],
             Op::Add(a, b) => {
@@ -612,7 +617,23 @@ struct Tile<'a> {
     y: u32,
     tile_size: u32,
     image_size: u32,
+    scale: f32,
     tape: std::borrow::Cow<'a, [(u16, Op)]>,
+}
+
+impl Tile<'_> {
+    fn bounds(&self) -> (Interval, Interval) {
+        let b = Interval::new(-1.0, 1.0);
+        let ix = Interval::new(
+            b.lerp(self.x as f32 / self.image_size as f32),
+            b.lerp((self.x + self.tile_size) as f32 / self.image_size as f32),
+        );
+        let iy = Interval::new(
+            b.lerp(self.y as f32 / self.image_size as f32),
+            b.lerp((self.y + self.tile_size) as f32 / self.image_size as f32),
+        );
+        (ix, iy)
+    }
 }
 
 struct Fill {
@@ -652,21 +673,9 @@ enum Next<'a> {
 
 impl Tile<'_> {
     fn run(self, scratch: &mut Vec<[Interval; 16]>, out: &mut Vec<Next>) {
-        let bounds = Interval::new(-1.0, 1.0);
-        let ix = Interval::new(
-            bounds.lerp(self.x as f32 / self.image_size as f32),
-            bounds.lerp(
-                (self.x + self.tile_size) as f32 / self.image_size as f32,
-            ),
-        );
-        let iy = Interval::new(
-            bounds.lerp(self.y as f32 / self.image_size as f32),
-            bounds.lerp(
-                (self.y + self.tile_size) as f32 / self.image_size as f32,
-            ),
-        );
+        let (ix, iy) = self.bounds();
         let (values, choices) =
-            interval_split::<16>(&self.tape, scratch, ix, iy);
+            interval_split::<16>(&self.tape, scratch, ix, iy, self.scale);
         let mut simplified = simplify(&self.tape, &choices);
         for j in 0..4 {
             for i in 0..4 {
@@ -679,10 +688,11 @@ impl Tile<'_> {
                         x,
                         y,
                         tile_size,
-                        image_size: self.image_size,
                         tape: std::borrow::Cow::Owned(std::mem::take(
                             &mut simplified[k],
                         )),
+                        image_size: self.image_size,
+                        scale: self.scale,
                     }));
                 } else {
                     if tile_size == 128 {
@@ -710,11 +720,10 @@ impl Tile<'_> {
     }
 }
 
-fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
+fn render_recursive(ops: &[(u16, Op)], size: u32, scale: f32) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
     let mut scratch_f = Slots::new();
-    let bounds = Interval::new(-1.0, 1.0);
     let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
 
     // Render a set of 128x128 interval regions
@@ -729,6 +738,7 @@ fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
                 tile_size: 512,
                 image_size: size,
                 tape: std::borrow::Cow::Borrowed(ops),
+                scale,
             });
         }
     }
@@ -750,15 +760,8 @@ fn render_recursive(ops: &[(u16, Op)], size: u32) -> Vec<[u8; 4]> {
 
     let mut next = vec![];
     for t in tiles {
-        let ix = Interval::new(
-            bounds.lerp(t.x as f32 / t.image_size as f32),
-            bounds.lerp((t.x + t.tile_size) as f32 / t.image_size as f32),
-        );
-        let iy = Interval::new(
-            bounds.lerp(t.y as f32 / t.image_size as f32),
-            bounds.lerp((t.y + 8) as f32 / t.image_size as f32),
-        );
-        let vs = float_tile::<64>(&t.tape, &mut scratch_f, ix, iy);
+        let (ix, iy) = t.bounds();
+        let vs = float_tile::<64>(&t.tape, &mut scratch_f, ix, iy, scale);
         next.push((t.x, t.y, t.tile_size, vs));
     }
 
@@ -799,28 +802,31 @@ fn main() {
         "image size must be a multiple of {WIDTH}"
     );
 
+    let image_size = args.size.next_multiple_of(512);
+    let scale = image_size as f32 / args.size as f32;
+
     let start_time = std::time::Instant::now();
     for _ in 0..args.count {
         if args.fancy {
-            pixels = render_recursive(&ops, args.size);
+            pixels = render_recursive(&ops, image_size, scale);
         } else {
             pixels.clear();
-            for iy in (0..args.size).rev() {
-                let y = ((iy as f32) / (args.size as f32) - 0.5) * 2.0;
+            for iy in (0..image_size).rev() {
+                let y = ((iy as f32) / (image_size as f32) - 0.5) * 2.0;
                 let ys = [y; WIDTH];
-                for ix in 0..args.size / WIDTH as u32 {
+                for ix in 0..image_size / WIDTH as u32 {
                     let mut xs = [0.0; WIDTH];
                     for (j, x) in xs.iter_mut().enumerate() {
                         *x = ((ix as f32 * WIDTH as f32 + j as f32)
-                            / (args.size as f32)
+                            / (image_size as f32)
                             - 0.5)
                             * 2.0;
                     }
                     let vs = if args.normalize {
-                        let gs = pixel_g(&ops, &mut scratch_g, xs, ys);
+                        let gs = pixel_g(&ops, &mut scratch_g, xs, ys, scale);
                         gs.map(|g| g.v * 2.0) // condensed field lines
                     } else {
-                        pixel_f(&ops, &mut scratch_f, xs, ys)
+                        pixel_f(&ops, &mut scratch_f, xs, ys, scale)
                     };
                     for v in vs {
                         pixels.push(shade(v));
@@ -838,7 +844,15 @@ fn main() {
     );
 
     if let Some(out) = &args.out {
-        let raw_pixels: Vec<u8> = pixels.into_iter().flatten().collect();
+        let mut raw_pixels = vec![[0u8; 4]; (args.size as usize).pow(2)];
+        let offset = (image_size - args.size) / 2;
+        for j in 0..args.size {
+            for i in 0..args.size {
+                raw_pixels[(j * args.size + i) as usize] =
+                    pixels[((j + offset) * image_size + i + offset) as usize];
+            }
+        }
+        let raw_pixels: Vec<u8> = raw_pixels.into_iter().flatten().collect();
         let img: ImageBuffer<Rgba<u8>, _> =
             ImageBuffer::from_raw(args.size, args.size, raw_pixels)
                 .expect("failed to create image buffer");
