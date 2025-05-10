@@ -1,0 +1,12 @@
+x_ var-x
+dx const -0.05
+x add x_ dx
+x2 square x
+y_ var-y
+dy const 0.25
+y add y_ dy
+y2 square y
+r2 add x2 y2
+r sqrt r2
+v const 0.5
+out sub r v

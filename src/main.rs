@@ -4,7 +4,6 @@ use fidget::{
     vm::Choice,
 };
 use image::{ImageBuffer, Rgba};
-use rayon::prelude::*;
 use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -111,6 +110,21 @@ struct Args {
 
     #[clap(long)]
     normalize: bool,
+
+    #[clap(long, conflicts_with = "normalize")]
+    bad_normalize: bool,
+
+    #[clap(long, conflicts_with = "normalize")]
+    check_grad: bool,
+
+    #[clap(long, conflicts_with_all = ["normalize", "fancy"])]
+    save_grad: bool,
+
+    #[clap(long, requires = "fancy")]
+    binary: bool,
+
+    #[clap(long, requires = "fancy")]
+    pseudo: bool,
 
     #[clap(long)]
     fancy: bool,
@@ -223,7 +237,7 @@ fn pixel_f<const N: usize>(
 ///
 /// If the gradient is very small, then the value is scaled up based on the
 /// internal epsilon parameter
-pub fn normalize(g: Grad) -> Grad {
+pub fn normalize_g(g: Grad) -> Grad {
     let norm = (g.dx.powi(2) + g.dy.powi(2) + g.dz.powi(2))
         .sqrt()
         .max(0.01);
@@ -236,6 +250,7 @@ fn pixel_g<const N: usize>(
     x: [f32; N],
     y: [f32; N],
     scale: f32,
+    normalize: bool,
 ) -> [Grad; N] {
     scratch.resize(ops.len(), [Grad::from(0.0); N]);
     for (i, op) in ops {
@@ -278,14 +293,22 @@ fn pixel_g<const N: usize>(
             }
             Op::Max(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] = normalize(scratch[*a as usize][j])
-                        .max(normalize(scratch[*b as usize][j]))
+                    scratch[i][j] = if normalize {
+                        normalize_g(scratch[*a as usize][j])
+                            .max(normalize_g(scratch[*b as usize][j]))
+                    } else {
+                        scratch[*a as usize][j].max(scratch[*b as usize][j])
+                    };
                 }
             }
             Op::Min(a, b) => {
                 for j in 0..N {
-                    scratch[i][j] = normalize(scratch[*a as usize][j])
-                        .min(normalize(scratch[*b as usize][j]))
+                    scratch[i][j] = if normalize {
+                        normalize_g(scratch[*a as usize][j])
+                            .min(normalize_g(scratch[*b as usize][j]))
+                    } else {
+                        scratch[*a as usize][j].min(scratch[*b as usize][j])
+                    };
                 }
             }
             Op::Const(f) => {
@@ -369,6 +392,40 @@ fn interval_split<const N: usize>(
     interval_i(ops, scratch, xs, ys, scale)
 }
 
+fn pseudo_interval_split<const N: usize>(
+    ops: &[(u16, Op)],
+    scratch_f: &mut Slots<f32, N>,
+    scratch_g: &mut Vec<[Grad; N]>,
+    x: Interval,
+    y: Interval,
+    scale: f32,
+    normalize: bool,
+) -> [Interval; N] {
+    let side = (N as f64).sqrt() as usize;
+    assert_eq!(side * side, N);
+    let mut xs = [0.0; N];
+    let mut ys = [0.0; N];
+    let mut k = 0;
+    for i in 0..side {
+        let y = y.lerp((i as f32 + 0.5) / side as f32);
+        for j in 0..side {
+            let x = x.lerp((j as f32 + 0.5) / side as f32);
+            xs[k] = x;
+            ys[k] = y;
+            k += 1;
+        }
+    }
+    let vs = if normalize {
+        let gs = pixel_g(ops, scratch_g, xs, ys, scale, normalize);
+        gs.map(|g| g.v)
+    } else {
+        pixel_f(ops, scratch_f, xs, ys, scale)
+    };
+    let r = (x.width().powi(2) + y.width().powi(2)).sqrt() / 2.0 / side as f32
+        * scale;
+    vs.map(|v| Interval::new(v - r, v + r))
+}
+
 fn interval_i<const N: usize>(
     ops: &[(u16, Op)],
     scratch: &mut Vec<[Interval; N]>,
@@ -440,7 +497,6 @@ fn interval_i<const N: usize>(
             Op::Square(a) => {
                 for j in 0..N {
                     let v = scratch[*a as usize][j];
-                    println!("{} {}", v.square(), v * v);
                     scratch[i][j] = v.square();
                 }
             }
@@ -607,9 +663,27 @@ fn simplify<const N: usize>(
 }
 
 fn shade(f: f32) -> [u8; 4] {
-    use fidget::render::RenderMode;
-    let [r, g, b] = fidget::render::SdfPixelRenderMode::pixel(f);
-    [r, g, b, 255]
+    let r = 1.0 - 0.1f32.copysign(f);
+    let g = 1.0 - 0.4f32.copysign(f);
+    let b = 1.0 - 0.7f32.copysign(f);
+
+    let dim = 1.0 - (-4.0 * f.abs()).exp(); // dimming near 0
+    let bands = 0.8 + 0.2 * (140.0 * f).cos(); // banding
+
+    let smoothstep = |edge0: f32, edge1: f32, x: f32| {
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let mix = |x: f32, y: f32, a: f32| x * (1.0 - a) + y * a;
+
+    let run = |v: f32| {
+        let mut v = v * dim * bands;
+        v = mix(v, 1.0, 1.0 - smoothstep(0.0, 0.010, f.abs()));
+        v = mix(v, 1.0, 1.0 - smoothstep(0.0, 0.001, f.abs()));
+        (v.clamp(0.0, 1.0) * 255.0) as u8
+    };
+
+    [run(r), run(g), run(b), 255]
 }
 
 struct Tile<'a> {
@@ -652,10 +726,10 @@ impl Fill {
                 let k = (self.image_size - (self.y + j) - 1) * self.image_size
                     + self.x
                     + i;
-                if i == 0
-                    || i == self.tile_size - 1
-                    || j == 0
-                    || j == self.tile_size - 1
+                if i <= 1
+                    || i >= self.tile_size - 2
+                    || j <= 1
+                    || j >= self.tile_size - 2
                 {
                     pixels[k as usize] = self.edge_color;
                 } else {
@@ -671,8 +745,12 @@ enum Next<'a> {
     Fill(Fill),
 }
 
-impl Tile<'_> {
-    fn run(self, scratch: &mut Vec<[Interval; 16]>, out: &mut Vec<Next>) {
+impl<'a> Tile<'a> {
+    fn run_interval(
+        self,
+        scratch: &mut Vec<[Interval; 16]>,
+        out: &mut Vec<Next>,
+    ) {
         let (ix, iy) = self.bounds();
         let (values, choices) =
             interval_split::<16>(&self.tape, scratch, ix, iy, self.scale);
@@ -695,9 +773,54 @@ impl Tile<'_> {
                         scale: self.scale,
                     }));
                 } else {
-                    if tile_size == 128 {
-                        println!("{ix} {iy} => {}", values[k]);
-                    }
+                    out.push(Next::Fill(Fill {
+                        x,
+                        y,
+                        tile_size,
+                        image_size: self.image_size,
+                        fill_color: if values[k].upper() < 0.0 {
+                            [200, 200, 200, 255]
+                        } else {
+                            [50, 50, 50, 255]
+                        },
+                        edge_color: if values[k].upper() < 0.0 {
+                            [180, 180, 180, 255]
+                        } else {
+                            [20, 20, 20, 255]
+                        },
+                    }))
+                }
+            }
+        }
+    }
+
+    fn run_pseudo_interval(
+        self,
+        scratch_f: &mut Slots<f32, 16>,
+        scratch_g: &mut Vec<[Grad; 16]>,
+        out: &mut Vec<Next<'a>>,
+        normalize: bool,
+    ) {
+        let (ix, iy) = self.bounds();
+        let values = pseudo_interval_split::<16>(
+            &self.tape, scratch_f, scratch_g, ix, iy, self.scale, normalize,
+        );
+        for j in 0..4 {
+            for i in 0..4 {
+                let k = j * 4 + i;
+                let x = self.x + i as u32 * self.tile_size / 4;
+                let y = self.y + j as u32 * self.tile_size / 4;
+                let tile_size = self.tile_size / 4;
+                if values[k].contains(0.0) || values[k].has_nan() {
+                    out.push(Next::Tile(Tile {
+                        x,
+                        y,
+                        tile_size,
+                        tape: self.tape.clone(),
+                        image_size: self.image_size,
+                        scale: self.scale,
+                    }));
+                } else {
                     out.push(Next::Fill(Fill {
                         x,
                         y,
@@ -720,9 +843,21 @@ impl Tile<'_> {
     }
 }
 
-fn render_recursive(ops: &[(u16, Op)], size: u32, scale: f32) -> Vec<[u8; 4]> {
+enum Mode {
+    Interval,
+    PseudoInterval(bool),
+}
+
+fn render_recursive(
+    ops: &[(u16, Op)],
+    size: u32,
+    scale: f32,
+    mode: Mode,
+) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
+    let mut scratch_p = Slots::new();
+    let mut scratch_g = Vec::new();
     let mut scratch_f = Slots::new();
     let mut pixels = vec![[0u8; 4]; (size as usize).pow(2)];
 
@@ -744,10 +879,18 @@ fn render_recursive(ops: &[(u16, Op)], size: u32, scale: f32) -> Vec<[u8; 4]> {
     }
 
     // 512, 128, 32
-    for _ in 0..3 {
+    for _ in 0..2 {
         let mut next = vec![];
         for t in tiles {
-            t.run(&mut scratch_i, &mut next);
+            match mode {
+                Mode::Interval => t.run_interval(&mut scratch_i, &mut next),
+                Mode::PseudoInterval(norm) => t.run_pseudo_interval(
+                    &mut scratch_p,
+                    &mut scratch_g,
+                    &mut next,
+                    norm,
+                ),
+            }
         }
         tiles = vec![];
         for n in next {
@@ -761,7 +904,7 @@ fn render_recursive(ops: &[(u16, Op)], size: u32, scale: f32) -> Vec<[u8; 4]> {
     let mut next = vec![];
     for t in tiles {
         let (ix, iy) = t.bounds();
-        let vs = float_tile::<64>(&t.tape, &mut scratch_f, ix, iy, scale);
+        let vs = float_tile::<1024>(&t.tape, &mut scratch_f, ix, iy, scale);
         next.push((t.x, t.y, t.tile_size, vs));
     }
 
@@ -796,19 +939,48 @@ fn main() {
     let mut scratch_g = vec![];
 
     const WIDTH: usize = 16;
-    assert_eq!(
-        args.size % (WIDTH as u32),
-        0,
-        "image size must be a multiple of {WIDTH}"
-    );
-
     let image_size = args.size.next_multiple_of(512);
     let scale = image_size as f32 / args.size as f32;
 
     let start_time = std::time::Instant::now();
     for _ in 0..args.count {
         if args.fancy {
-            pixels = render_recursive(&ops, image_size, scale);
+            pixels = render_recursive(
+                &ops,
+                image_size,
+                scale,
+                if args.pseudo {
+                    Mode::PseudoInterval(args.normalize)
+                } else {
+                    Mode::Interval
+                },
+            );
+        } else if args.save_grad {
+            pixels.clear();
+            for iy in (0..image_size).rev() {
+                let y = ((iy as f32) / (image_size as f32) - 0.5) * 2.0;
+                let ys = [y; WIDTH];
+                for ix in 0..image_size / WIDTH as u32 {
+                    let mut xs = [0.0; WIDTH];
+                    for (j, x) in xs.iter_mut().enumerate() {
+                        *x = ((ix as f32 * WIDTH as f32 + j as f32)
+                            / (image_size as f32)
+                            - 0.5)
+                            * 2.0;
+                    }
+                    let vs = {
+                        let gs =
+                            pixel_g(&ops, &mut scratch_g, xs, ys, scale, false);
+                        gs.map(|g| {
+                            (g.dx.powi(2) + g.dy.powi(2) + g.dz.powi(2)).sqrt()
+                        })
+                    };
+                    for v in vs {
+                        let p = (v * 255.0) as u16;
+                        pixels.push([(p % 255) as u8, (p / 255) as u8, 0, 255]);
+                    }
+                }
+            }
         } else {
             pixels.clear();
             for iy in (0..image_size).rev() {
@@ -823,8 +995,25 @@ fn main() {
                             * 2.0;
                     }
                     let vs = if args.normalize {
-                        let gs = pixel_g(&ops, &mut scratch_g, xs, ys, scale);
-                        gs.map(|g| g.v * 2.0) // condensed field lines
+                        let gs =
+                            pixel_g(&ops, &mut scratch_g, xs, ys, scale, true);
+                        gs.map(|g| g.v)
+                    } else if args.bad_normalize {
+                        let gs =
+                            pixel_g(&ops, &mut scratch_g, xs, ys, scale, false);
+                        gs.map(|g| normalize_g(g).v)
+                    } else if args.check_grad {
+                        let gs =
+                            pixel_g(&ops, &mut scratch_g, xs, ys, scale, false);
+                        gs.iter().for_each(|g| {
+                            let norm =
+                                (g.dx.powi(2) + g.dy.powi(2) + g.dz.powi(2))
+                                    .sqrt();
+                            if norm > 1.0 + 1e-1 {
+                                panic!("got norm {norm}");
+                            }
+                        });
+                        gs.map(|g| g.v)
                     } else {
                         pixel_f(&ops, &mut scratch_f, xs, ys, scale)
                     };
@@ -848,8 +1037,17 @@ fn main() {
         let offset = (image_size - args.size) / 2;
         for j in 0..args.size {
             for i in 0..args.size {
-                raw_pixels[(j * args.size + i) as usize] =
-                    pixels[((j + offset) * image_size + i + offset) as usize];
+                let a = (j * args.size + i) as usize;
+                let b = ((j + offset) * image_size + i + offset) as usize;
+                if args.binary {
+                    raw_pixels[a] = if pixels[b][0] > 128 {
+                        [255; 4]
+                    } else {
+                        [0, 0, 0, 255]
+                    };
+                } else {
+                    raw_pixels[a] = pixels[b];
+                }
             }
         }
         let raw_pixels: Vec<u8> = raw_pixels.into_iter().flatten().collect();

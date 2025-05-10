@@ -1,0 +1,23 @@
+# Rotated coordinate system
+x var-x
+y var-y
+t const 0.707
+nx neg x
+ny neg y
+a mul x t
+b mul y t
+x_ add a b
+c mul nx t
+d mul y t
+# Rectangle
+r const 0.6
+y_ add c d
+nx_ neg x_
+ny_ neg y_
+x0 sub x_ r
+x1 sub nx_ r
+y0 sub y_ r
+y1 sub ny_ r
+xs max x0 x1
+ys max y0 y1
+out max xs ys
