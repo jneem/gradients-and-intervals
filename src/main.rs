@@ -126,6 +126,9 @@ struct Args {
     #[clap(long, requires = "fancy")]
     pseudo: bool,
 
+    #[clap(long, requires = "fancy", conflicts_with = "binary")]
+    tape_len: bool,
+
     #[clap(long)]
     fancy: bool,
 
@@ -337,6 +340,121 @@ fn pixel_g<const N: usize>(
     scratch[ops.last().unwrap().0 as usize]
 }
 
+fn pixel_gi<const N: usize>(
+    ops: &[(u16, Op)],
+    scratch: &mut Vec<[Grad; N]>,
+    x: [f32; N],
+    y: [f32; N],
+    scale: f32,
+    radius: f32,
+    normalize: bool,
+) -> ([Grad; N], Vec<[Choice; N]>) {
+    scratch.resize(ops.len(), [Grad::from(0.0); N]);
+    let mut choices = vec![];
+    for (i, op) in ops {
+        let i = *i as usize;
+        match op {
+            Op::VarX => {
+                for (j, x) in x.iter().enumerate() {
+                    scratch[i][j] = Grad::new(*x * scale, 1.0, 0.0, 0.0)
+                }
+            }
+            Op::VarY => {
+                for (j, y) in y.iter().enumerate() {
+                    scratch[i][j] = Grad::new(*y * scale, 0.0, 1.0, 0.0)
+                }
+            }
+            Op::Copy(a) => scratch[i] = scratch[*a as usize],
+            Op::Add(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] + scratch[*b as usize][j]
+                }
+            }
+            Op::Sub(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] - scratch[*b as usize][j]
+                }
+            }
+            Op::Mul(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] * scratch[*b as usize][j]
+                }
+            }
+            Op::Div(a, b) => {
+                for j in 0..N {
+                    scratch[i][j] =
+                        scratch[*a as usize][j] / scratch[*b as usize][j]
+                }
+            }
+            Op::Max(a, b) => {
+                let mut cs = [Choice::Both; N];
+                for (j, cs) in cs.iter_mut().enumerate() {
+                    let mut va = scratch[*a as usize][j];
+                    let mut vb = scratch[*b as usize][j];
+                    if normalize {
+                        va = normalize_g(va);
+                        vb = normalize_g(vb);
+                    }
+                    scratch[i][j] = va.max(vb);
+                    *cs = if va.v + 2.0 * radius < vb.v {
+                        Choice::Right
+                    } else if vb.v + 2.0 * radius < va.v {
+                        Choice::Left
+                    } else {
+                        Choice::Both
+                    };
+                }
+                choices.push(cs);
+            }
+            Op::Min(a, b) => {
+                let mut cs = [Choice::Both; N];
+                for (j, cs) in cs.iter_mut().enumerate() {
+                    let mut va = scratch[*a as usize][j];
+                    let mut vb = scratch[*b as usize][j];
+                    if normalize {
+                        va = normalize_g(va);
+                        vb = normalize_g(vb);
+                    }
+                    scratch[i][j] = va.min(vb);
+                    *cs = if va.v + 2.0 * radius < vb.v {
+                        Choice::Left
+                    } else if vb.v + 2.0 * radius < va.v {
+                        Choice::Right
+                    } else {
+                        Choice::Both
+                    };
+                }
+                choices.push(cs);
+            }
+            Op::Const(f) => {
+                for j in 0..N {
+                    scratch[i][j] = Grad::from(**f)
+                }
+            }
+            Op::Square(a) => {
+                for j in 0..N {
+                    let v = scratch[*a as usize][j];
+                    scratch[i][j] = v * v;
+                }
+            }
+            Op::Neg(a) => {
+                for j in 0..N {
+                    scratch[i][j] = -scratch[*a as usize][j];
+                }
+            }
+            Op::Sqrt(a) => {
+                for j in 0..N {
+                    scratch[i][j] = scratch[*a as usize][j].sqrt();
+                }
+            }
+        };
+    }
+    (scratch[ops.last().unwrap().0 as usize], choices)
+}
+
 #[inline(never)]
 fn float_tile<const N: usize>(
     ops: &[(u16, Op)],
@@ -395,11 +513,9 @@ fn interval_split<const N: usize>(
 fn pseudo_interval_split<const N: usize>(
     ops: &[(u16, Op)],
     scratch_f: &mut Slots<f32, N>,
-    scratch_g: &mut Vec<[Grad; N]>,
     x: Interval,
     y: Interval,
     scale: f32,
-    normalize: bool,
 ) -> [Interval; N] {
     let side = (N as f64).sqrt() as usize;
     assert_eq!(side * side, N);
@@ -415,15 +531,38 @@ fn pseudo_interval_split<const N: usize>(
             k += 1;
         }
     }
-    let vs = if normalize {
-        let gs = pixel_g(ops, scratch_g, xs, ys, scale, normalize);
-        gs.map(|g| g.v)
-    } else {
-        pixel_f(ops, scratch_f, xs, ys, scale)
-    };
     let r = (x.width().powi(2) + y.width().powi(2)).sqrt() / 2.0 / side as f32
         * scale;
+    let vs = pixel_f(ops, scratch_f, xs, ys, scale);
     vs.map(|v| Interval::new(v - r, v + r))
+}
+
+fn pseudo_interval_norm_split<const N: usize>(
+    ops: &[(u16, Op)],
+    scratch_g: &mut Vec<[Grad; N]>,
+    x: Interval,
+    y: Interval,
+    scale: f32,
+) -> ([Interval; N], Vec<[Choice; N]>) {
+    let side = (N as f64).sqrt() as usize;
+    assert_eq!(side * side, N);
+    let mut xs = [0.0; N];
+    let mut ys = [0.0; N];
+    let mut k = 0;
+    for i in 0..side {
+        let y = y.lerp((i as f32 + 0.5) / side as f32);
+        for j in 0..side {
+            let x = x.lerp((j as f32 + 0.5) / side as f32);
+            xs[k] = x;
+            ys[k] = y;
+            k += 1;
+        }
+    }
+    let r = (x.width().powi(2) + y.width().powi(2)).sqrt() / 2.0 / side as f32
+        * scale;
+    let (gs, choices) = pixel_gi(ops, scratch_g, xs, ys, scale, r, true);
+    let vs = gs.map(|g| Interval::new(g.v - r, g.v + r));
+    (vs, choices)
 }
 
 fn interval_i<const N: usize>(
@@ -717,6 +856,7 @@ struct Fill {
     image_size: u32,
     fill_color: [u8; 4],
     edge_color: [u8; 4],
+    tape_len: usize,
 }
 
 impl Fill {
@@ -788,6 +928,57 @@ impl<'a> Tile<'a> {
                         } else {
                             [20, 20, 20, 255]
                         },
+                        tape_len: self.tape.len(),
+                    }))
+                }
+            }
+        }
+    }
+
+    fn run_pseudo_interval_norm(
+        self,
+        scratch: &mut Vec<[Grad; 16]>,
+        out: &mut Vec<Next<'a>>,
+    ) {
+        let (ix, iy) = self.bounds();
+        let (values, choices) = pseudo_interval_norm_split::<16>(
+            &self.tape, scratch, ix, iy, self.scale,
+        );
+        let mut simplified = simplify(&self.tape, &choices);
+        for j in 0..4 {
+            for i in 0..4 {
+                let k = j * 4 + i;
+                let x = self.x + i as u32 * self.tile_size / 4;
+                let y = self.y + j as u32 * self.tile_size / 4;
+                let tile_size = self.tile_size / 4;
+                if values[k].contains(0.0) || values[k].has_nan() {
+                    out.push(Next::Tile(Tile {
+                        x,
+                        y,
+                        tile_size,
+                        tape: std::borrow::Cow::Owned(std::mem::take(
+                            &mut simplified[k],
+                        )),
+                        image_size: self.image_size,
+                        scale: self.scale,
+                    }));
+                } else {
+                    out.push(Next::Fill(Fill {
+                        x,
+                        y,
+                        tile_size,
+                        image_size: self.image_size,
+                        fill_color: if values[k].upper() < 0.0 {
+                            [200, 200, 200, 255]
+                        } else {
+                            [50, 50, 50, 255]
+                        },
+                        edge_color: if values[k].upper() < 0.0 {
+                            [180, 180, 180, 255]
+                        } else {
+                            [20, 20, 20, 255]
+                        },
+                        tape_len: self.tape.len(),
                     }))
                 }
             }
@@ -796,14 +987,12 @@ impl<'a> Tile<'a> {
 
     fn run_pseudo_interval(
         self,
-        scratch_f: &mut Slots<f32, 16>,
-        scratch_g: &mut Vec<[Grad; 16]>,
+        scratch: &mut Slots<f32, 16>,
         out: &mut Vec<Next<'a>>,
-        normalize: bool,
     ) {
         let (ix, iy) = self.bounds();
         let values = pseudo_interval_split::<16>(
-            &self.tape, scratch_f, scratch_g, ix, iy, self.scale, normalize,
+            &self.tape, scratch, ix, iy, self.scale,
         );
         for j in 0..4 {
             for i in 0..4 {
@@ -836,6 +1025,7 @@ impl<'a> Tile<'a> {
                         } else {
                             [20, 20, 20, 255]
                         },
+                        tape_len: self.tape.len(),
                     }))
                 }
             }
@@ -853,6 +1043,7 @@ fn render_recursive(
     size: u32,
     scale: f32,
     mode: Mode,
+    save_lengths: bool,
 ) -> Vec<[u8; 4]> {
     assert_eq!(size % 512, 0, "size {size} must be divisible by 512");
     let mut scratch_i = vec![];
@@ -884,40 +1075,71 @@ fn render_recursive(
         for t in tiles {
             match mode {
                 Mode::Interval => t.run_interval(&mut scratch_i, &mut next),
-                Mode::PseudoInterval(norm) => t.run_pseudo_interval(
-                    &mut scratch_p,
-                    &mut scratch_g,
-                    &mut next,
-                    norm,
-                ),
+                Mode::PseudoInterval(norm) => {
+                    if norm {
+                        t.run_pseudo_interval_norm(&mut scratch_g, &mut next)
+                    } else {
+                        // NOTE this doesn't do tape simplification
+                        t.run_pseudo_interval(&mut scratch_p, &mut next)
+                    }
+                }
             }
         }
         tiles = vec![];
         for n in next {
             match n {
                 Next::Tile(t) => tiles.push(t),
-                Next::Fill(f) => f.run(&mut pixels),
+                Next::Fill(mut f) => {
+                    if save_lengths {
+                        f.fill_color = [
+                            (f.tape_len % 256) as u8,
+                            (f.tape_len / 256) as u8,
+                            0,
+                            255,
+                        ];
+                        f.edge_color = f.fill_color;
+                    }
+                    f.run(&mut pixels)
+                }
             }
         }
     }
 
-    let mut next = vec![];
-    for t in tiles {
-        let (ix, iy) = t.bounds();
-        let vs = float_tile::<1024>(&t.tape, &mut scratch_f, ix, iy, scale);
-        next.push((t.x, t.y, t.tile_size, vs));
-    }
+    if save_lengths {
+        for t in tiles {
+            let color = [
+                (t.tape.len() % 256) as u8,
+                (t.tape.len() / 256) as u8,
+                0,
+                255,
+            ];
+            for j in 0..t.tile_size {
+                for i in 0..t.tile_size {
+                    let p =
+                        (t.image_size - (t.y + j) - 1) * t.image_size + t.x + i;
+                    pixels[p as usize] = color;
+                }
+            }
+        }
+    } else {
+        let mut next = vec![];
+        for t in tiles {
+            let (ix, iy) = t.bounds();
+            let vs = float_tile::<1024>(&t.tape, &mut scratch_f, ix, iy, scale);
+            next.push((t.x, t.y, t.tile_size, vs));
+        }
 
-    for (x, y, tile_size, vs) in next {
-        for j in 0..tile_size {
-            for i in 0..tile_size {
-                let k = j * tile_size + i;
-                let p = (size - (y + j) - 1) * size + x + i;
-                pixels[p as usize] = if vs[k as usize] < 0.0 {
-                    [255; 4]
-                } else {
-                    [0, 0, 0, 255]
-                };
+        for (x, y, tile_size, vs) in next {
+            for j in 0..tile_size {
+                for i in 0..tile_size {
+                    let k = j * tile_size + i;
+                    let p = (size - (y + j) - 1) * size + x + i;
+                    pixels[p as usize] = if vs[k as usize] < 0.0 {
+                        [255; 4]
+                    } else {
+                        [0, 0, 0, 255]
+                    };
+                }
             }
         }
     }
@@ -954,6 +1176,7 @@ fn main() {
                 } else {
                     Mode::Interval
                 },
+                args.tape_len,
             );
         } else if args.save_grad {
             pixels.clear();
@@ -977,7 +1200,7 @@ fn main() {
                     };
                     for v in vs {
                         let p = (v * 255.0) as u16;
-                        pixels.push([(p % 255) as u8, (p / 255) as u8, 0, 255]);
+                        pixels.push([(p % 256) as u8, (p / 256) as u8, 0, 255]);
                     }
                 }
             }

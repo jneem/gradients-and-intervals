@@ -19,4 +19,8 @@ cargo run --release -- -i models/hello_world.txt -o $BLOG/hello_norm_bad@2x.png 
 cargo run --release -- -i models/hello_world.txt -o $BLOG/hello_norm_good@2x.png --size=768 --normalize
 cargo run --release -- -i models/hello_world.txt -o $BLOG/hello_pseudo@2x.png --size=768 --normalize --pseudo --fancy
 
+# Need to be post-processed in Python
+cargo run --release -- -i models/hello_world.txt -o $BLOG/hello_len_interval.png --size=512 --fancy --tape-len
+cargo run --release -- -i models/hello_world.txt -o $BLOG/hello_len_pseudo.png --size=512 --normalize --pseudo --fancy --tape-len
+
 cd ~/Web && make -j8
