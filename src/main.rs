@@ -241,9 +241,7 @@ fn pixel_f<const N: usize>(
 /// If the gradient is very small, then the value is scaled up based on the
 /// internal epsilon parameter
 pub fn normalize_g(g: Grad) -> Grad {
-    let norm = (g.dx.powi(2) + g.dy.powi(2) + g.dz.powi(2))
-        .sqrt()
-        .max(0.01);
+    let norm = (g.dx.abs() + g.dy.abs() + g.dz.abs()).max(0.01);
     Grad::new(g.v / norm, g.dx / norm, g.dy / norm, g.dz / norm)
 }
 
@@ -558,8 +556,7 @@ fn pseudo_interval_norm_split<const N: usize>(
             k += 1;
         }
     }
-    let r = (x.width().powi(2) + y.width().powi(2)).sqrt() / 2.0 / side as f32
-        * scale;
+    let r = x.width().max(y.width()) / 2.0 / side as f32 * scale;
     let (gs, choices) = pixel_gi(ops, scratch_g, xs, ys, scale, r, true);
     let vs = gs.map(|g| Interval::new(g.v - r, g.v + r));
     (vs, choices)
